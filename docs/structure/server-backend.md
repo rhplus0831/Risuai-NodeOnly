@@ -33,6 +33,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | `server/node/runtime/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
 | `server/node/runtime/request-trace.cjs` | Opt-in whole-exchange debug tracing. `createRequestTracer()` captures only completed non-streaming HTTP exchanges, writes atomic gzip files under `save/trace`, and retains the newest 500 without affecting request handling on trace failures. |
 | `server/node/runtime/selfUpdate.cjs` | Public-stats, update-check, and portable self-update routes via `registerSelfUpdateRoutes(app, ctx)`. Owns deployment-type detection, release/asset resolution, and the in-process recovery-path state-lock tail (`withLocalRecoveryPathStateLock()`); exports `isSelfUpdateInProgress()` and the recovery-path test gate, which the backup-path admission in `server.cjs` shares so both families serialize on one queue. |
+| `server/node/runtime/proxy.cjs` | Reverse-proxy (`/proxy`, `/proxy2`), Hub proxy, and local proxy-stream-job routes via `registerProxyRoutes(app, ctx)`. Owns the job map/lifecycle, target sanitation for stream jobs, and the job WebSocket; exports `checkProxyAuth` (reused by model-jobs registration), `setupProxyStreamWebSocket(server)` (attached by both HTTP/HTTPS boot branches), and `startProxyStreamJobGc()` (the proxy half of the formerly fused boot GC interval; the partial-export half stays in `server.cjs`). Target allow-policy itself stays in `runtime/proxyTarget.cjs`. |
 | `server/node/plugin-storage/pluginSaveKeys.cjs` | Canonical optimized-plugin prefixes, manifest/folded markers, and lossless physical-key policy: UTF-8/base64url, tagged ill-formed UTF-16, or manifest-v3-mapped archive-safe hashes. |
 | `server/node/plugin-storage/pluginStorageJson.cjs`, `pluginStorageLimits.cjs` | Strict and lossless plugin-row codecs, key/row validation, and authoritative per-value and aggregate optimized-storage limits. `lossless-json-v1` is distinguished by the `PRISUL01` frame magic; metadata remains strict-JSON-only. |
 | `server/node/db/stageRowDownload.cjs` | Opens one validated read-only descriptor for a staged plugin transition row and streams from that same descriptor, avoiding a validation/reopen race. |
@@ -678,7 +679,7 @@ are sent to the ordinary application log; it adds no provider API.
 - `msgpackr` and `fflate` implement RisuAI save compatibility in `server/node/utils.cjs:1`.
 - `fast-json-patch` applies client patches at `server/node/server.cjs:73`.
 - Express, `compression`, `express-rate-limit`, and `node-html-parser` provide HTTP routing, response compression, login throttling, and root-page flag injection.
-- `ws` supplies the proxy-job WebSocket server at `server/node/server.cjs:24`.
+- `ws` supplies the proxy-job WebSocket server in `server/node/runtime/proxy.cjs`.
 - `wasm-vips` generates thumbnails and compresses inlays at `server/node/server.cjs:25`.
 - Native `fetch` calls arbitrary authenticated proxy targets, `https://sv.risuai.xyz` for Hub traffic, Google OAuth, the configured PocketRisu update worker, and GitHub release assets.
 - `child_process.spawn()` runs restart helpers; `execSync()` invokes platform archive tools during self-update.
@@ -1025,8 +1026,9 @@ are sent to the ordinary application log; it adds no provider API.
   `createBackupAndRotate()`, `snapshotFootprint()`, `server/node/plugin-storage/pluginSaveKeys.cjs`, and
   the snapshot routes.
 
-- To change proxy target policy, inspect `server/node/runtime/proxyTarget.cjs`,
-  `sanitizeTargetUrl()`, general proxy handlers, model jobs, and proxy-stream WebSockets;
+- To change proxy target policy, inspect `server/node/runtime/proxyTarget.cjs` and
+  `server/node/runtime/proxy.cjs` (`sanitizeTargetUrl()`, the general proxy handlers,
+  and proxy-stream WebSockets), plus model jobs;
   each transport has a different target policy.
 
 - To change update checks or portable replacement, inspect

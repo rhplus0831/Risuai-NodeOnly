@@ -61,7 +61,7 @@ function normalizeUpstreamHeaders(input) {
 }
 
 // Native http/https request with abort support — mirrors the approach of
-// requestLocalTargetStream in server.cjs (native client so the body arrives
+// requestLocalTargetStream in proxy.cjs (native client so the body arrives
 // as raw bytes, no implicit decompression like Node's fetch).
 function requestUpstreamStream(targetUrl, arg) {
     return new Promise((resolve, reject) => {

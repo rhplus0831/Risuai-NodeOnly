@@ -1134,7 +1134,7 @@ function normalizeJSON(value, preservePluginStorageKeys = false) {
 }
 
 // Strip auth/control and hop-by-hop headers before forwarding a client-supplied
-// header object upstream. Shared by server.cjs (/proxy2, proxy-stream) and
+// header object upstream. Shared by runtime/proxy.cjs (/proxy2, proxy-stream) and
 // model-jobs.cjs — a single copy of the security strip-list. Keys are passed
 // through as-is (no case normalization); the strip-set matches lowercase names.
 function normalizeForwardHeaders(input) {
