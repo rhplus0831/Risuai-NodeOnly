@@ -585,9 +585,24 @@ describe('AA3 atomic plugin storage batch', () => {
     expect(read.missing).toBe(false)
     expect(createHash('sha256').update(Buffer.from(read.value, 'base64')).digest('hex'))
       .toBe(createHash('sha256').update(value).digest('hex'))
-    const spool = await readdir(server.spoolDir)
-    expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
+    await expectNoBatchValueSpools(server)
   }, 90_000)
+
+  // Staged batch-value spool files are unlinked from the response's
+  // 'finish'/'close' events, so a client that has already read the response
+  // body can race the server's cleanup callback under load. Poll briefly
+  // instead of asserting instantly; the files must still drain.
+  async function expectNoBatchValueSpools(server: ServerHandle): Promise<void> {
+    const deadline = Date.now() + 5_000
+    let leftover: string[]
+    do {
+      const spool = await readdir(server.spoolDir)
+      leftover = spool.filter(name => name.startsWith('.plugin-batch-value-'))
+      if (leftover.length === 0) return
+      await new Promise(resolve => setTimeout(resolve, 25))
+    } while (Date.now() < deadline)
+    expect(leftover).toEqual([])
+  }
 
   test('rejects a corrupt framed value before publication and removes its stage', async () => {
     const { server, client } = await boot()
@@ -609,8 +624,7 @@ describe('AA3 atomic plugin storage batch', () => {
       code: 'INVALID_PLUGIN_STORAGE_BATCH',
     })
     await expect(readState(client, key)).resolves.toMatchObject({ missing: true })
-    const spool = await readdir(server.spoolDir)
-    expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
+    await expectNoBatchValueSpools(server)
   })
 
   test('checks streamed revisions after staging and leaves no committed prefix or spool', async () => {
@@ -634,8 +648,7 @@ describe('AA3 atomic plugin storage batch', () => {
       code: 'PLUGIN_STORAGE_REVISION_CONFLICT',
     })
     expect(readPhysicalPair(server.cwd, key)).toEqual(before)
-    const spool = await readdir(server.spoolDir)
-    expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
+    await expectNoBatchValueSpools(server)
   })
 
   test('rolls a staged file write back with its owner and manifest', async () => {
@@ -659,8 +672,7 @@ describe('AA3 atomic plugin storage batch', () => {
       code: 'PLUGIN_STORAGE_BATCH_ROLLED_BACK',
     })
     expect(readPhysicalPair(server.cwd, key)).toEqual(before)
-    const spool = await readdir(server.spoolDir)
-    expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
+    await expectNoBatchValueSpools(server)
   })
 
   test('staged status cannot consume a tentative matching import publication', async () => {
