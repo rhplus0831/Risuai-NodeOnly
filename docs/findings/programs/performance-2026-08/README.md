@@ -85,10 +85,10 @@ Harness facts (details in `test/e2e/readme.md`):
 - Fixture templates cache under `test/e2e/.templates/` — **delete the
   directory whenever a change affects imported state** (server ingest,
   seed shape); stale templates silently mask ingest changes.
-- `test:compat` full runs currently flake under memory pressure
-  (`full-export-import-race` RSS caps, occasional `EADDRINUSE`,
-  `admitted-write-spool` timeout). Known issue, fix deferred by the owner:
-  if those are the only failures, rerun the files in isolation and report.
+- `test:compat` runs the RSS-sensitive `full-export-import-race` file in its
+  own execution group after the parallel compat files. Remaining full-run
+  flakes under memory pressure include occasional `EADDRINUSE` and the
+  `admitted-write-spool` timeout; rerun those files in isolation and report.
 - Programmatic API calls need `x-client-build` from `dist/build-stamp.json`.
 - The mock model provider uses fixed port 46791 (provider + verification
   specs only, one worker at a time).

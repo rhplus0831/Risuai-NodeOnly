@@ -8,7 +8,7 @@ import {
   readdir,
   writeFile,
 } from 'node:fs/promises'
-import { afterAll, describe, expect, test } from 'vitest'
+import { afterAll, afterEach, describe, expect, test } from 'vitest'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { decodeBackup } from './helpers/decode.js'
 import { encodeBackup } from './helpers/encode.js'
@@ -20,9 +20,12 @@ const MIB = 1024 * 1024
 const DB_BLOB_HEX = Buffer.from('database/database.bin', 'utf-8').toString('hex')
 const servers: ServerHandle[] = []
 
-afterAll(async () => {
-  await Promise.allSettled(servers.map(server => server.cleanup()))
-})
+async function cleanupServers(): Promise<void> {
+  await Promise.allSettled(servers.splice(0).map(server => server.cleanup()))
+}
+
+afterEach(cleanupServers)
+afterAll(cleanupServers)
 
 function epochBackup(epoch: 'old' | 'new', asset: Buffer, inlay: Buffer): Buffer {
   return Buffer.concat([
@@ -266,21 +269,27 @@ async function readRssBytes(pid: number): Promise<number> {
 
 async function withPeakRss<T>(server: ServerHandle, operation: () => Promise<T>): Promise<{
   result: T
+  baseline: number
+  peak: number
   increase: number
+  samples: number
 }> {
   const baseline = await readRssBytes(server.pid)
   let peak = baseline
+  let samples = 1
   let stopped = false
   const sampler = (async () => {
     while (!stopped) {
       peak = Math.max(peak, await readRssBytes(server.pid))
+      samples += 1
       await new Promise(resolve => setTimeout(resolve, 5))
     }
   })()
   try {
     const result = await operation()
     peak = Math.max(peak, await readRssBytes(server.pid))
-    return { result, increase: peak - baseline }
+    samples += 1
+    return { result, baseline, peak, increase: peak - baseline, samples }
   } finally {
     stopped = true
     await sampler
@@ -539,6 +548,14 @@ describe('full backup point-in-time filesystem pins', () => {
     expect((await client.importBackup(seed)).ok).toBe(true)
 
     const exported = await withPeakRss(server, () => client.exportBackup())
+    if (process.env.POCKETRISU_RSS_DIAG === 'true') {
+      console.info('[rss-diag] large-external-chat', JSON.stringify({
+        baseline: exported.baseline,
+        peak: exported.peak,
+        increase: exported.increase,
+        samples: exported.samples,
+      }))
+    }
     expect(exported.increase).toBeLessThan(48 * MIB)
     const database = decodeRisuDat(
       entriesByName(exported.result).get('database.risudat')!,
