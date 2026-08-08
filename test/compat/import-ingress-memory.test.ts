@@ -152,7 +152,9 @@ async function writeRuntimeAsset(client: RisuClient, key: string, value: Buffer)
 async function runExternalDedup(server: ServerHandle): Promise<ReturnType<typeof spawnSync>> {
   const peer = path.join(server.cwd, 'external-dedup-peer', 'save', 'assets')
   await mkdir(peer, { recursive: true })
-  await writeFile(path.join(peer, 'peer.bin'), Buffer.from('external dedup peer'))
+  // PocketRisu instances create asset files with mode 0600; a faithful peer
+  // must match or the dedup metadata-uniformity preflight refuses the run.
+  await writeFile(path.join(peer, 'peer.bin'), Buffer.from('external dedup peer'), { mode: 0o600 })
   return spawnSync(
     'bash',
     [path.resolve('scripts/dedup-assets.sh'), path.join(server.cwd, 'save', 'assets'), peer],
