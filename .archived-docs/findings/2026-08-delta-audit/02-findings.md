@@ -40,7 +40,7 @@ overlay with dirty revisions created after capture.
 ### DA-3. Server restart lets a pre-restart tab replace newer chat rows (D-F3)
 Surface: merge cluster (`1b9e536f`, `eae52cbc`, `818c3bc1`) + chat full-row
 fallback. The writer lock is process-local; after restart `peek()` reports
-`free` ([session-lock.cjs:68,99](../../../server/node/session-lock.cjs)) and
+`free` ([session-lock.cjs:68,99](../../../server/node/runtime/session-lock.cjs)) and
 initialized tabs never re-run the freshness handshake
 ([nodeStorage.ts:1655](../../../src/ts/storage/nodeStorage.ts)). A stale
 tab's refused chat delta is swallowed into an unconditional full-row write
@@ -68,7 +68,7 @@ mismatch before success is reported.
 ### DA-13. Plugin-storage viewer save silently retypes unchanged values (C-F1)
 Surface: `e53ec7a3`/`783a4ef8` viewer + `244d7a88` lossless values. The
 facet projection collapses distinct values into one display text
-([pluginStorageViewerFacets.cjs:6-10](../../../server/node/pluginStorageViewerFacets.cjs):
+([pluginStorageViewerFacets.cjs:6-10](../../../server/node/plugin-storage/pluginStorageViewerFacets.cjs):
 string `"true"` → `true`, `null`/`undefined` → `''`), and `saveEdit()`
 re-parses that text into a typed value
 ([PluginStorageViewer.svelte:380-400](../../../src/lib/Setting/Pages/PluginStorageViewer.svelte)).
@@ -88,7 +88,7 @@ loss as expected
 ([plugin-storage-bulk-transition.test.ts:119-131](../../../test/compat/plugin-storage-bulk-transition.test.ts))
 — and folded RisuSave transcoding maps both `["u"]` and `["h"]` tags to
 MessagePack `undefined`
-([streamJsonToMsgpack.cjs:600-607](../../../server/node/streamJsonToMsgpack.cjs)),
+([streamJsonToMsgpack.cjs:600-607](../../../server/node/backup/streamJsonToMsgpack.cjs)),
 so recovery copies lose hole identity even for correctly-encoded rows.
 Fix: explicit occupancy transport (tags/bitmap) pre-Packr; versioned
 hole/undefined distinction in folded publication.
@@ -131,11 +131,11 @@ generation identity after every await; per-chat guard for terminal recovery.
 
 ### DA-7. Sidecar DBs reintroduce NORMAL-WAL rollback; shutdown does not drain (D-F5)
 `model-jobs.db` / `request-logs.db` hard-code `synchronous=NORMAL`
-([model-jobs.cjs:146](../../../server/node/model-jobs.cjs),
-[request-logs.cjs:229](../../../server/node/request-logs.cjs)) — the
+([model-jobs.cjs:146](../../../server/node/runtime/model-jobs.cjs),
+[request-logs.cjs:229](../../../server/node/runtime/request-logs.cjs)) — the
 durability class the primary DB fix removed — and SIGTERM closes the store
 without draining active jobs
-([model-jobs.cjs:756](../../../server/node/model-jobs.cjs),
+([model-jobs.cjs:756](../../../server/node/runtime/model-jobs.cjs),
 [server.cjs:21462](../../../server/node/server.cjs)), so a complete journal
 can be recovered as an error. Fix: FULL profile + journal fsync before
 terminal status; bounded drain on shutdown.
