@@ -32,6 +32,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | `server/node/runtime/model-jobs.cjs` | Durable upstream model relay. `createModelJobs()` stores non-secret job metadata in `save/model-jobs.db`, records exact provider response bytes in append-only journals under `save/model-jobs/`, tails running streams, supports claims, and owns 48-hour pending-send tombstones. Main jobs are recoverable; auxiliary pipeline requests are relay-only. |
 | `server/node/runtime/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
 | `server/node/runtime/request-trace.cjs` | Opt-in whole-exchange debug tracing. `createRequestTracer()` captures only completed non-streaming HTTP exchanges, writes atomic gzip files under `save/trace`, and retains the newest 500 without affecting request handling on trace failures. |
+| `server/node/runtime/selfUpdate.cjs` | Public-stats, update-check, and portable self-update routes via `registerSelfUpdateRoutes(app, ctx)`. Owns deployment-type detection, release/asset resolution, and the in-process recovery-path state-lock tail (`withLocalRecoveryPathStateLock()`); exports `isSelfUpdateInProgress()` and the recovery-path test gate, which the backup-path admission in `server.cjs` shares so both families serialize on one queue. |
 | `server/node/plugin-storage/pluginSaveKeys.cjs` | Canonical optimized-plugin prefixes, manifest/folded markers, and lossless physical-key policy: UTF-8/base64url, tagged ill-formed UTF-16, or manifest-v3-mapped archive-safe hashes. |
 | `server/node/plugin-storage/pluginStorageJson.cjs`, `pluginStorageLimits.cjs` | Strict and lossless plugin-row codecs, key/row validation, and authoritative per-value and aggregate optimized-storage limits. `lossless-json-v1` is distinguished by the `PRISUL01` frame magic; metadata remains strict-JSON-only. |
 | `server/node/db/stageRowDownload.cjs` | Opens one validated read-only descriptor for a staged plugin transition row and streams from that same descriptor, avoiding a validation/reopen race. |
@@ -1028,8 +1029,9 @@ are sent to the ordinary application log; it adds no provider API.
   `sanitizeTargetUrl()`, general proxy handlers, model jobs, and proxy-stream WebSockets;
   each transport has a different target policy.
 
-- To change update checks or portable replacement, inspect `fetchLatestRelease()`, the
-  public/update routes, `src/ts/update.ts`, `scripts/updater.cjs`, `update.sh`, and
+- To change update checks or portable replacement, inspect
+  `server/node/runtime/selfUpdate.cjs` (which owns `fetchLatestRelease()` and the
+  public/update routes), `src/ts/update.ts`, `scripts/updater.cjs`, `update.sh`, and
   `server/node/recoveryPathMarkers.cjs` together. All destructive updater paths require
   an absent startup-quarantine transaction plus both durable recovery-root markers, and
   fail closed when any of that preservation state cannot be validated.
