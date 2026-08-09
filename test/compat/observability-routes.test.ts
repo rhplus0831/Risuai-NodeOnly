@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import { createClient } from './helpers/client.js'
+import { createSeedBackup } from './helpers/seed.js'
 import { spawnServer } from './helpers/spawnServer.js'
 
 describe('observability and database-maintenance routes', () => {
@@ -111,6 +112,45 @@ describe('observability and database-maintenance routes', () => {
         expect(Number.isSafeInteger(body.freeBytes)).toBe(true)
         expect(body.freeBytes).toBeGreaterThanOrEqual(0)
       }
+    } finally {
+      await server.cleanup()
+    }
+  })
+
+  test('deletes a server backup and reports a repeated delete as missing', async () => {
+    const server = await spawnServer()
+    try {
+      const client = await createClient(server.port, server.password)
+      expect((await client.importBackup(createSeedBackup())).ok).toBe(true)
+
+      const saved = await client.fetch('/api/backup/server/save', { method: 'POST' })
+      expect(saved.status).toBe(200)
+      const events = (await saved.text()).trim().split('\n').map(line => JSON.parse(line))
+      const done = events.find(event => event.type === 'done') as { filename?: string } | undefined
+      expect(done?.filename).toMatch(/^risu-backup-\d+\.bin$/)
+      const filename = done!.filename!
+
+      const listed = await client.fetch('/api/backup/server/list')
+      expect(listed.status).toBe(200)
+      await expect(listed.json()).resolves.toEqual({
+        backups: [{
+          filename,
+          size: expect.any(Number),
+          createdAt: expect.any(Number),
+        }],
+      })
+
+      const deleted = await client.fetch(`/api/backup/server/${filename}`, { method: 'DELETE' })
+      expect(deleted.status).toBe(200)
+      await expect(deleted.json()).resolves.toEqual({ ok: true })
+
+      const empty = await client.fetch('/api/backup/server/list')
+      expect(empty.status).toBe(200)
+      await expect(empty.json()).resolves.toEqual({ backups: [] })
+
+      const deletedAgain = await client.fetch(`/api/backup/server/${filename}`, { method: 'DELETE' })
+      expect(deletedAgain.status).toBe(404)
+      await expect(deletedAgain.json()).resolves.toEqual({ error: 'Backup file not found' })
     } finally {
       await server.cleanup()
     }

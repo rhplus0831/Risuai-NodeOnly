@@ -738,7 +738,7 @@ limit while clients may still change the snapshot count.
 
 ## Change map
 
-- Full/server point-in-time export: start at `pinFullBackupState()`,
+- Full/server point-in-time export: start at `backupRoutes.cjs` and `pinFullBackupState()`,
   `streamBackupRisuSave.cjs`, `streamRisuSaveToFile()`, filesystem pin/copy helpers, disk
   reservations, and full export regression suites.
 - Partial jobs: update preparation/writer code, the `/api/backup/export/jobs` route
@@ -759,7 +759,8 @@ limit while clients may still change the snapshot count.
 - Destructive result UX: update `storageError.ts`, `backupReplacementUi.ts`,
   `snapshotRestoreUi.ts`, `writerTakeover.ts`, route acknowledgement schemas, and UI
   tests together.
-- Server-backup deployment: coordinate the path routes and markers in `server.cjs`,
+- Server-backup deployment: coordinate the path routes in `backupRoutes.cjs`, the markers
+  and live-root state in `server.cjs`,
   `update.sh`, `docker-compose.yml`, hub-hosting guards, and their contract tests.
 
 ## Verification
