@@ -326,7 +326,9 @@ describe('AA3 atomic plugin storage batch', () => {
       'utf-8',
     )
     const routeStart = source.indexOf("app.post('/api/plugin-storage/batch'")
-    const routeEnd = source.indexOf('const PLUGIN_STORAGE_SIZE_PREFIXES', routeStart)
+    // End marker: the storage list-sizes registration call that directly follows
+    // the batch route (the former inline route moved to runtime/observability.cjs).
+    const routeEnd = source.indexOf('registerStorageListSizesRoute(app', routeStart)
     expect(routeStart).toBeGreaterThanOrEqual(0)
     expect(routeEnd).toBeGreaterThan(routeStart)
     const route = source.slice(routeStart, routeEnd)
