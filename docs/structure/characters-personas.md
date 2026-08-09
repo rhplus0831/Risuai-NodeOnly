@@ -1,7 +1,7 @@
 # Characters and personas
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-09 against `e2f6d2ea`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -66,7 +66,7 @@ Character metadata lives inside the main database object, while image and other 
 
   - `PackageManifest` defines `type: "risuCharacterPackage"` and `version: 1`; `parseAndValidatePackage()` reads that member through the indexed streaming ZIP reader and validates the exact type/version.
   - `scanCharacterInlayIds()` recognizes `{{inlay::...}}`, `{{inlayed::...}}`, and `{{inlayeddata::...}}`; export scans one streamed chat at a time to collect referenced IDs and bound personas.
-  - `importChatsToCharacter()` parses `chats/chats.json` incrementally, remaps persona/folder identities, assigns each chat a new UUID, writes the normalized authoritative row immediately, and retains only a placeholder for database publication.
+  - `importChatsToCharacter()` first parses the declared chat entry without writes and requires its row count to match the manifest. It then replays the entry incrementally, remaps persona/folder identities, assigns each chat a new UUID, writes the normalized authoritative row immediately, and retains only a placeholder for database publication. A missing, unreadable, malformed, truncated, or short entry fails the import.
   - `exportCharacterPackage()` writes the outer ZIP incrementally and supplies `chats/chats.json` as an async iterable rather than materializing all chats or the archive.
   - `importCharacterPackage()` creates a new character from a package; `importPackageToCharacter()` appends package chats/personas/inlays to an existing character but deliberately ignores the packaged card fields.
 
@@ -105,13 +105,13 @@ Character metadata lives inside the main database object, while image and other 
 
 - `src/ts/process/processzip.ts` — streaming CharX ZIP writer/importer.
 
-  - `processZip()` is an unrelated image-generation helper that extracts the first image from a ZIP at `src/ts/process/processzip.ts:19`.
-  - `CharXWriter` incrementally writes ZIP members, sanitizes filenames, and supports JPEG-prefixed output at `src/ts/process/processzip.ts:46`.
-  - `CharXImporter` streams a ZIP, extracts `card.json` and optional `module.risum`, and saves remaining members as assets with concurrency limited to ten at `src/ts/process/processzip.ts:160`.
-  - `CharXImporter.parse()` accepts `Uint8Array`, `File`, or `ReadableStream` at `src/ts/process/processzip.ts:235`.
-  - `CharXImporter.done()` must be awaited to observe all queued asset saves and errors at `src/ts/process/processzip.ts:271`.
-  - File dispatch treats `card.json` and `module.risum` specially, ignores other JSON, and treats everything else as an asset at `src/ts/process/processzip.ts:362`.
-  - `CharXSkippableChecker()` probes the hub for a double-hashed archive signal at `src/ts/process/processzip.ts:442`; it currently has no callers.
+  - `processZip()` is an unrelated image-generation helper that extracts the first image from a ZIP at `src/ts/process/processzip.ts:118`.
+  - `CharXWriter` incrementally writes ZIP members, sanitizes filenames, and supports JPEG-prefixed output at `src/ts/process/processzip.ts:150`.
+  - `CharXImporter` streams a ZIP, extracts `card.json` and optional `module.risum`, and saves asset members with concurrency limited to ten at `src/ts/process/processzip.ts:331`.
+  - `CharXImporter.parse()` accepts `Uint8Array`, `File`, or `ReadableStream` at `src/ts/process/processzip.ts:414`.
+  - `CharXImporter.done()` must be awaited to observe all queued asset saves and errors at `src/ts/process/processzip.ts:450`.
+  - `CharXImporter.#handleFileComplete()` reserves exact `card.json`, exact `module.risum`, and normalized `x_meta/*` members; every other member is queued as an asset regardless of extension, so arbitrary JSON is preserved (`src/ts/process/processzip.ts:551`). During finalization, referenced `x_meta/*.json` members become assets while unreferenced metadata is validated and omitted (`src/ts/process/processzip.ts:613`).
+  - `CharXSkippableChecker()` probes the hub for a double-hashed archive signal at `src/ts/process/processzip.ts:654`; it currently has no callers.
 
 ### RPack, `.risum`, and `.risup`
 
@@ -273,7 +273,7 @@ For V3:
 9. CharX additionally writes `module.risum` and removes scripts from the card’s `risuai` extension before writing `card.json`.
 10. PNG V3 writes base64 card JSON under `ccv3`.
 
-For V2, `createBaseV2()` emits standard V2 fields plus `extensions.risuai` and writes base64 card JSON under `chara`. V2 is explicitly a compatibility path; current export does not populate its commented-out emotion or additional-asset arrays.
+For V2, `createBaseV2()` emits standard V2 fields plus `extensions.risuai` and writes base64 card JSON under `chara`. V2 is explicitly a compatibility path; current export does not populate its commented-out emotion or additional-asset arrays. Both V2 and V3 adapt local lore through `adaptLorebookEntryForCard()`, which emits `use_regex: lore.useRegex ?? false`.
 
 The low-level exporter can also write a V2 card object as ordinary JSON; base64 wrapping applies to PNG `chara` metadata, not to standalone JSON files. The normal export chooser exposes V2 PNG rather than a separate V2 JSON option.
 
@@ -293,8 +293,9 @@ New-character import:
 1. Index the replayable ZIP, read only `manifest.json`, and validate the exact package type/version; selected members are subsequently inflated one at a time with backpressure rather than through whole-archive `fflate.unzip`.
 2. Stream the inner CharX into its importer, or create a blank character for an empty package.
 3. Import selected persona members and build an old-ID-to-new-ID map.
-4. Read chat metadata, then parse `chats/chats.json` incrementally. Each callback remaps persona/folder IDs, assigns a fresh chat UUID, normalizes and directly persists the authoritative row, and appends only its placeholder to the new character.
-5. Stream selected inlay members sequentially, publish the character metadata/stub block through normal client storage, and repair ordering.
+4. Run a no-write metadata pass over the complete declared chat entry. A missing or unreadable member, malformed or truncated JSON, an invalid manifest count, or a parsed row count that disagrees with the manifest aborts the import before chat publication.
+5. Replay the entry incrementally. Each callback remaps persona/folder IDs, assigns a fresh chat UUID, normalizes and directly persists the authoritative row, and appends only its placeholder to the new character; the import pass verifies its metadata and parsed row counts against the manifest again.
+6. Stream selected inlay members sequentially, publish the character metadata/stub block through normal client storage, and repair ordering.
 
 Existing-character import ignores the packaged character card itself and appends only personas, chats/folders, and inlays.
 
@@ -377,6 +378,7 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - V3 inline `data:` assets compare the base64 text length to 50 MiB, so the decoded-byte ceiling is lower than 50 MiB (`src/ts/characterCards.ts:787`).
 - The intended 5 MiB PNG `chara`/`ccv3` guard checks the previous accumulator length before assignment and therefore does not currently bound the incoming chunk. Do not rely on it as an effective import limit (`src/ts/characterCards.ts:177`).
 - `ccv3` takes precedence when a PNG contains both V2 `chara` and V3 `ccv3`.
+- `convertCharbook()` maps CCv2/CCv3 `book.use_regex` back to local `useRegex`. It first clears the flag when the first key does not begin with `/`, so valid regex lore semantics round-trip while malformed regex declarations remain disabled.
 - `exportCharacterCard()` sets `char.image = ""` after reading it at `src/ts/characterCards.ts:1173`. Normal UI callers pass a clone, but a new direct caller must not assume its argument remains unchanged.
 - `exportCharacterCard()` declares a `password` option, but current export code never uses it. Password-protected RCC is import-only compatibility.
 - Current V2 export leaves emotion and additional-asset properties commented out in `createBaseV2()`. Use V3 CharX for lossless asset export.

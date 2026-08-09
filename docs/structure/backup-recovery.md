@@ -1,7 +1,7 @@
 # Backup and recovery
 
 > Part of the [PocketRisu structure guide](../../STRUCTURE.md). Audited on
-> 2026-08-04 against `95c2ea30`. Prefer symbols and route names over line numbers.
+> 2026-08-09 against `e2f6d2ea`. Prefer symbols and route names over line numbers.
 
 ## Purpose and recovery taxonomy
 
@@ -188,8 +188,14 @@ The current endpoints are the create/status/cancel collection under
 `/api/backup/export/jobs` plus `/:jobId/download`. Calling the old partial scope through
 the full-export endpoint returns `PARTIAL_EXPORT_JOB_REQUIRED`.
 
-Character-package and dataset export streams are separate interchange surfaces; see
-[Characters and personas](characters-personas.md) and [Client storage](client-storage.md).
+Character-package and dataset export streams are separate interchange surfaces. A
+declared character-package chat entry must be found, fully parsed, and match its manifest
+row count in a metadata pass before import writes any chat rows; the import pass repeats
+the exact-completion check before adopting the placeholders. A missing entry,
+malformed/truncated content, or fewer parsed rows than declared therefore fails the
+package import closed. See
+[Characters and personas](characters-personas.md) for package details and
+[Client storage](client-storage.md) for dataset export.
 
 ### Bounded import and save-folder replacement
 
@@ -777,11 +783,11 @@ Representative guarantees live in:
 - `test/compat/hub-hosting.test.ts`
 - `test/compat/docker-deployment-contract.test.ts`
 - `test/compat/plugin-storage-boot-reconcile.test.ts`
-- `server/node/chatBackups.test.ts`
-- `server/node/importJournal.test.ts`
+- `server/node/chat/chatBackups.test.ts`
+- `server/node/backup/importJournal.test.ts`
 - `server/node/updateScript.test.ts`
 - `server/node/windowsRecoveryLockFinalizer.test.ts`
-- `server/node/snapshotPluginStorage.e2e.test.ts`
+- `server/node/plugin-storage/snapshotPluginStorage.e2e.test.ts`
 - `src/ts/storage/nodeStorage.bootRecovery.test.ts`
 - `src/ts/storage/nodeStorageAvailability.test.ts`
 - `src/ts/storage/backupReplacementUi.test.ts`

@@ -1,7 +1,7 @@
 # Server backend
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-09 against `e2f6d2ea`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -13,58 +13,106 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 
 ### Node implementation
 
+The production inventory follows the subsystem folders under `server/node/`; the
+composition root and cross-subsystem coverage anchors are listed separately.
+
+#### Composition root and shared files
+
 | File | Role and important symbols |
 |---|---|
 | `server/node/server.cjs` | Executable Express backend and lifecycle composition root. It owns auth/writer fencing, storage queues, shared chat/filesystem stores, automatic snapshots, startup recovery, and the mutable state crossed by extracted route families through ctx getters/wrappers. `startServer()` performs recovery/preflight/migrations before selecting HTTP/HTTPS and `HOST`/`PORT`; loading the module starts the application. |
-| `server/node/db/db.cjs` | Opens `save/risuai.db`, applies SQLite pragmas, owns KV/delta-list primitives, pins read-only WAL snapshots, initializes chunks, and maintains derived plugin usage/owner indexes and atomic quota plans. |
-| `server/node/db/chunkStore.cjs` | Protected content-defined storage for the live DB, automatic snapshots, chat rows, and plugin values. It owns manifest metadata/publications, logical size/SHA verification, bounded raw-row streaming, snapshot sharing/cost, and mark/sweep GC. |
-| `server/node/chat/chatRows.cjs` | Injected chat-row store and the monolith-ingestion boundary. It owns encoded chat keys, missing/duplicate-ID repair, stub semantics, referenced-row diff/sweep helpers, split/assembly, and the transactional `ingestFullDatabase()` and `ingestStreamingDatabase()` paths. Duplicate `chaId` repair happens before row keys are finalized. |
-| `server/node/chat/chatBackups.cjs` | Per-chat pre-image history. Ordinary overwrites are best-effort and enforce a 45-second per-chat cooldown; structural chat deletion forces a cooldown-exempt capture and fails closed. Reconciliation streams each loose version into an atomic, self-describing `.frame` containing one independent gzip member, enforces the exact 125-version default plus a 256 MiB per-chat uncompressed-byte default, applies the separate globally age-ordered compressed-disk budget, and restores exact raw bytes by inflating only the selected frame. Legacy solid v1 bundles remain readable and migrate through bounded one-pass extraction without becoming authoritative until every replacement is durable. |
-| `server/node/backup/importBarrier.cjs` | Abort-aware exclusive import gate. `acquire()` claims a FIFO turn before draining older mutations; abandoned waiters are removed safely, later writes are refused, and stable reads can wait with an `AbortSignal`. |
-| `server/node/backup/importJournal.cjs` | Durable bridge between SQLite import transactions and filesystem asset/inlay directory swaps. It atomically writes/fsyncs `save/import_journal.json`, fsyncs staged trees, and recovers by finalizing committed swaps or restoring pre-import directories. |
-| `server/node/backup/backupRoutes.cjs` | Full/partial export, archive import, server-file and chat-backup reads, save-folder migration, replacement-operation reconciliation, snapshot restore, boot-reminder, and server-backup-path routes through six position-preserving registrations. It owns full/partial pin and import machinery, the replacement registry, route-only restore failpoints and decode gate, and partial-export GC; shared automatic-snapshot/import-barrier/root state and the streaming-ingest restore gate remain in `server.cjs` and cross through ctx where needed. |
-| `server/node/runtime/session-lock.cjs` | In-memory single-writer authority. `register()` records a boot without stealing; `checkWrite()` distinguishes the active writer, fresh gesture-backed takeover, fresh passive compatibility writes, and stale rejection; `peek()` provides a side-effect-free foreground status. |
-| `server/node/runtime/boundedSessionState.cjs` | Bounded LRU state for per-browser protocol pins. The server uses `createBoundedSessionState()` to retain at most 50 session-scoped plugin-publication read states independently of writer authority. |
-| `server/node/chat/bufferedIngress.cjs` | Pre-parser admission for buffered JSON, octet-stream, and text bodies, plus identity-only admission for bodyless/direct-stream writers. It resolves auth/writer/route-limit policy, rejects retired protocols and mismatched client builds before reading a body, strictly validates uncompressed `Content-Length`, and reserves/relinquishes the process-wide in-flight byte budget without performing a writer-lock transition. |
-| `server/node/runtime/buildStamp.cjs` | Loads and validates `dist/build-stamp.json` for writer-mutation admission. `readClientBuildStamp()` returns `null` and logs a warning on any read, parse, or shape failure, deliberately disabling the build check rather than blocking the server. |
-| `server/node/chat/admittedIngressSpool.cjs` | Post-admission disk ingress for raw `/api/write` and raw/JSON chat-row writes. It consumes the already-reserved request in bounded pages, fsyncs a private spool in the installation-owned configured-spool namespace, preserves the reservation through response finish/close, and maps spool-volume pressure to the admission layer's retryable refusal. |
-| `server/node/backup/spoolOwnership.cjs` | Validates and atomically initializes persistent UUID files, claims a filesystem-safe installation spool namespace with the separate `__spool_owner_id` plus a canonical-save-root binding, and creates/revalidates the owned child of a configured shared root. Missing identities and claims use fsynced exclusive-link publication; invalid identities deterministically converge without a reclaimable lock pathname. Unsafe entries are atomically parked rather than conditionally unlinked. Identity/claim files and owned directories are accepted without following symlinks and hardened to private modes. Boot cleanup quarantines the claimed child and sweeps through pinned old/fresh directory descriptors; runtime consumers receive only a process-lifetime pinned directory alias. Analytics `__instance_id` is not filesystem ownership. |
-| `server/node/db/chunkPlan.cjs`, `chunkPlanWorker.cjs` | Bounded worker-thread preparation for private file sources. At most two workers by default scan FastCDC boundaries and compute per-chunk SHA-256 plus logical SHA-256/MD5 in one bounded-window pass; queued publication validates the immutable file identity and exact planned bytes. |
-| `server/node/runtime/model-jobs.cjs` | Durable upstream model relay. `createModelJobs()` stores non-secret job metadata in `save/model-jobs.db`, records exact provider response bytes in append-only journals under `save/model-jobs/`, tails running streams, supports claims, and owns 48-hour pending-send tombstones. Main jobs are recoverable; auxiliary pipeline requests are relay-only. |
-| `server/node/runtime/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
-| `server/node/runtime/request-trace.cjs` | Opt-in whole-exchange debug tracing. `createRequestTracer()` captures only completed non-streaming HTTP exchanges, writes atomic gzip files under `save/trace`, and retains the newest 500 without affecting request handling on trace failures. |
-| `server/node/runtime/selfUpdate.cjs` | Public-stats, update-check, and portable self-update routes via `registerSelfUpdateRoutes(app, ctx)`. Owns deployment-type detection, release/asset resolution, and the in-process recovery-path state-lock tail (`withLocalRecoveryPathStateLock()`); exports `isSelfUpdateInProgress()` and the recovery-path test gate, which `backupRoutes.cjs` uses directly so backup-path changes and self-update serialize on one queue. |
-| `server/node/runtime/proxy.cjs` | Reverse-proxy (`/proxy`, `/proxy2`), Hub proxy, and local proxy-stream-job routes via `registerProxyRoutes(app, ctx)`. Owns the job map/lifecycle, target sanitation for stream jobs, and the job WebSocket; exports `checkProxyAuth` (reused by model-jobs registration), `setupProxyStreamWebSocket(server)` (attached by both HTTP/HTTPS boot branches), and `startProxyStreamJobGc()` (called beside `backupRoutes.cjs`'s `startPartialExportJobGc()` in the boot IIFE). Target allow-policy itself stays in `runtime/proxyTarget.cjs`. |
-| `server/node/runtime/observability.cjs` | Client/server log routes (`/api/logs`), `/api/storage/capacity`, and `/api/storage/list-sizes` through position-preserving `registerStorageCapacityRoute`/`registerStorageListSizesRoute`/`registerLogRoutes` calls. Thin wrappers over `runtime/logs.cjs` and `db/db.cjs`; auth, import-barrier access, and disk-space checks cross from `server.cjs` through ctx. |
-| `server/node/plugin-storage/pluginStorageRoutes.cjs` | All `/api/plugin-storage/*` routes (clear, state, viewer, manifest, reconcile-boot, recovery, batch, mutate, staged/bulk/legacy transitions) plus their family-only helpers, registered through six position-preserving calls sharing one memoized per-app family. The publication engine — manifest read/write/generation, publication readers, session read-state, recovery-snapshot hooks, spool/stage lifecycle, and stream-limit constants — stays in `server.cjs` and crosses via ctx; `dbEtag` mutations go through the server-side `ensurePluginStorageTransitionDbEtag()`/`publishPluginStorageTransitionDbState()` wrappers. |
-| `server/node/db/maintenanceRoutes.cjs` | Storage dashboard and database maintenance routes: `/api/db/stats` (+`/characters`, `/modules`), `/api/db/optimize`, `/api/db/durability` GET/PUT, `/api/db/wal-checkpoint`, non-restore `/api/db/snapshots` (limits/list/delete), and `/api/assets/cleanup`. The durability/WAL engine and snapshot-limit persistence/rotation stay in `server.cjs`; destructive snapshot restore is registered immediately afterward from `backupRoutes.cjs`. Mutations cross only through named server-side wrappers such as `persistSqliteDurabilityMode()`, and mutable paths/ETag are read through getters at request time. |
-| `server/node/plugin-storage/pluginSaveKeys.cjs` | Canonical optimized-plugin prefixes, manifest/folded markers, and lossless physical-key policy: UTF-8/base64url, tagged ill-formed UTF-16, or manifest-v3-mapped archive-safe hashes. |
-| `server/node/plugin-storage/pluginStorageJson.cjs`, `pluginStorageLimits.cjs` | Strict and lossless plugin-row codecs, key/row validation, and authoritative per-value and aggregate optimized-storage limits. `lossless-json-v1` is distinguished by the `PRISUL01` frame magic; metadata remains strict-JSON-only. |
-| `server/node/db/stageRowDownload.cjs` | Opens one validated read-only descriptor for a staged plugin transition row and streams from that same descriptor, avoiding a validation/reopen race. |
-| `server/node/db/dbCachedRead.cjs` | Server half of the optional segmented boot-read protocol. It validates the client's hash inventory, splits the stubs-only database into root/character/preset/module/persona MessagePack segments, and emits bytes only for cache misses while preserving the full-view ETag. |
-| `server/node/db/databaseRevision.cjs`, `revisionBoundCache.cjs` | Transactional generation tracking and bounded decoded-cache reuse for `database.bin`. SQLite triggers advance a monotonic operational revision on insert, key/value update, and delete; clean decoded entries are revision-checked and LRU/size/heap-pressure evictable, while acknowledged dirty patch state remains pinned until persistence or explicit invalidation. |
-| `server/node/db/dbCachePersistence.cjs` | Synchronous core of dirty database-cache persistence, extracted from `persistDbCacheGeneration()`: graph guards (`findStubFlagLossChats`, duplicate chat IDs), plugin externalization, canonical encoding, and the single commit transaction. `runEmergencyDbFlush()` is the guarded fatal-exit variant: it skips on import, owned transaction, no pending work, stale/empty/non-normalized cache, or guard rejection, and never deletes chat rows because pre-image capture is asynchronous. |
-| `server/node/db/listDelta.cjs` | Builds full or delta `/api/list` responses from KV modification timestamps, the deletion journal, filesystem mtimes, and the list epoch. Delta eligibility is capped at six days. |
-| `server/node/assets/assetStore.cjs` | Filesystem-backed implementation for safe `assets/*` keys, including atomic write/rename, SHA-256 filename verification, dual-source listing, migration, clear, and import staging helpers. |
-| `server/node/assets/assetMaintenanceLock.cjs`, `assetDedup.cjs` | Cross-process exclusion shared by live asset mutations, destructive import swaps, journal recovery, and the controlled multi-instance dedup worker. Ancestor symlinks canonicalize to one identity; the swappable `assets` leaf itself may not be a symlink. Lock state lives beside that directory; dedup uses strict target and same-UID/GID/mode validation, locale-independent UTF-8 byte ordering, byte verification, link-to-hidden-temp, final inode/content/metadata revalidation, atomic rename, and directory fsync. |
-| `server/node/assets/assetGc.cjs` | Bounded recursive asset-reference discovery, persisted candidate bookkeeping, and two-pass grace planning for server-owned ordinary-asset garbage collection. |
-| `server/node/backup/streamRisuSave.cjs` | Object-based legacy encoder for already-materialized database state and compatibility export paths. |
-| `server/node/backup/streamBackupRisuSave.cjs` | Seekable source-to-source transformer for point-in-time full/partial export and automatic snapshots, including folded external chat/plugin/MCP rows without monolithizing state in memory. |
-| `server/node/backup/streamRisuLoad.cjs` | Bounded streaming inspector/decoder for supported RisuSave formats and snapshot/import ingestion. |
-| `server/node/backup/streamJsonToMsgpack.cjs`, `jsonValidateWorker.cjs` | Bounded JSON validation and streaming conversion used by import/restore compatibility paths. |
-| `server/node/backup/backupEntryFormat.cjs` | Archive header/framing, entry name/body bounds, byte-size planning, and preflight. |
-| `server/node/backup/importSpool.cjs` | Private bounded upload/file/ZIP ingress, central-directory/CRC validation, entry staging, cancellation, and cleanup. |
-| `server/node/backupSnapshot.test.ts`, `test/compat/export-concurrent-mutation.test.ts` | Prove pinned snapshot reads survive live updates/deletes, missing referenced chats abort exports, concurrent plugin changes cannot corrupt archive framing, and completed exports re-import exactly. |
-| `server/node/importBarrier.test.ts`, `server/node/importJournal.test.ts`, `test/compat/import-mutation-barrier.test.ts` | Cover hold-before-drain ordering, retryable mutation refusal, late import rollback, crash recovery for directory swaps, and list-epoch invalidation. |
-| `server/node/snapshotPluginStorage.e2e.test.ts`, `test/compat/snapshot-spool.test.ts` | Cover exact optimized-plugin recovery (including folded-empty/pre-marker cases), chunk-streamed snapshot writes, save-volume spooling, orphan cleanup, and non-fatal snapshot-only failures. |
-| `server/node/bufferedIngress.test.ts`, `session-lock.test.ts`, `model-jobs.test.ts`, `request-logs.test.ts` | Cover pre-parser admission/limits/concurrent byte accounting, writer registration/takeover compatibility, recoverable versus auxiliary job lifecycle and retention, journal streaming/security, pending sends, request masking/truncation/rotation, usage retention, route guards, and database closure. Real-server ingress ordering and abort release are covered by `test/compat/buffered-ingress-admission.test.ts`. |
-| `server/node/runtime/logs.cjs` | Separate SQLite-backed client/server diagnostic log sink in `save/logs.db`. It masks credentials, batches writes, builds the server logger, installs fatal process handlers (accepting an `onFatalExit` callback that `server.cjs` wires to the emergency database flush), and records otherwise-unlogged Express errors. This is distinct from provider request history and usage in `request-logs.cjs`. |
 | `server/node/utils.cjs` | Server-side implementation of RisuAI save formats, cached-read hash parsing, and patch-sync hashing. `RisuSaveType` must match the client enum; `decodeRisuSave()` accepts legacy raw, compressed, stream-compressed, and block formats; `calculateHash()`/`normalizeJSON()` must remain behaviorally aligned with the client. |
 | `server/node/readme.md` | Declares this tree as PocketRisu's production backend, documents root-CWD startup, and explicitly distinguishes the incomplete Hono scaffold. |
 | `server/node/ssl/Generate Certificate.sh` | Generates a local CA and server certificate into `server/node/ssl/certificate/`; see `server/node/ssl/Generate Certificate.sh:2`. |
 | `server/node/ssl/Generate Certificate.bat` | Windows equivalent of the certificate-generation helper. |
 | `server/node/ssl/ca.conf` | OpenSSL CA identity and extensions; CA constraints are at `server/node/ssl/ca.conf:16`. |
 | `server/node/ssl/server.conf` | Localhost server certificate request. SANs are only `localhost` and `127.0.0.1` at `server/node/ssl/server.conf:16`. |
+
+#### `assets/`
+
+| File | Role and important symbols |
+|---|---|
+| `server/node/assets/assetStore.cjs` | Filesystem-backed implementation for safe `assets/*` keys, including atomic write/rename, SHA-256 filename verification, dual-source listing, migration, clear, and import staging helpers. |
+| `server/node/assets/assetMaintenanceLock.cjs`, `assetDedup.cjs` | Cross-process exclusion shared by live asset mutations, destructive import swaps, journal recovery, and the controlled multi-instance dedup worker. Ancestor symlinks canonicalize to one identity; the swappable `assets` leaf itself may not be a symlink. Lock state lives beside that directory; dedup uses strict target and same-UID/GID/mode validation, locale-independent UTF-8 byte ordering, byte verification, link-to-hidden-temp, final inode/content/metadata revalidation, atomic rename, and directory fsync. |
+| `server/node/assets/assetGc.cjs` | Bounded recursive asset-reference discovery, persisted candidate bookkeeping, and two-pass grace planning for server-owned ordinary-asset garbage collection. |
+
+#### `backup/`
+
+| File | Role and important symbols |
+|---|---|
+| `server/node/backup/importBarrier.cjs` | Abort-aware exclusive import gate. `acquire()` claims a FIFO turn before draining older mutations; abandoned waiters are removed safely, later writes are refused, and stable reads can wait with an `AbortSignal`. |
+| `server/node/backup/importJournal.cjs` | Durable bridge between SQLite import transactions and filesystem asset/inlay directory swaps. It atomically writes/fsyncs `save/import_journal.json`, fsyncs staged trees, and recovers by finalizing committed swaps or restoring pre-import directories. |
+| `server/node/backup/backupRoutes.cjs` | Full/partial export, archive import, server-file and chat-backup reads, save-folder migration, replacement-operation reconciliation, snapshot restore, boot-reminder, and server-backup-path routes through six position-preserving registrations. It owns full/partial pin and import machinery, the replacement registry, route-only restore failpoints and decode gate, and partial-export GC; shared automatic-snapshot/import-barrier/root state and the streaming-ingest restore gate remain in `server.cjs` and cross through ctx where needed. |
+| `server/node/backup/backupImportIndex.cjs` | Private disk-backed SQLite index for large backup restores. `createBackupImportIndex()` bounds heap use while deduplicating archive names and tracking imported inlays, sidecars, and legacy metadata. |
+| `server/node/backup/mcpToolCallRecovery.cjs` | Remembered MCP tool-call key/snapshot helpers and bounded marker scanners used to fold or recover only referenced `cache/mcp-tool-calls/*` rows across save, export, and import paths. |
+| `server/node/backup/spoolOwnership.cjs` | Validates and atomically initializes persistent UUID files, claims a filesystem-safe installation spool namespace with the separate `__spool_owner_id` plus a canonical-save-root binding, and creates/revalidates the owned child of a configured shared root. Missing identities and claims use fsynced exclusive-link publication; invalid identities deterministically converge without a reclaimable lock pathname. Unsafe entries are atomically parked rather than conditionally unlinked. Identity/claim files and owned directories are accepted without following symlinks and hardened to private modes. Boot cleanup quarantines the claimed child and sweeps through pinned old/fresh directory descriptors; runtime consumers receive only a process-lifetime pinned directory alias. Analytics `__instance_id` is not filesystem ownership. |
+| `server/node/backup/streamRisuSave.cjs` | Object-based legacy encoder for already-materialized database state and compatibility export paths. |
+| `server/node/backup/streamBackupRisuSave.cjs` | Seekable source-to-source transformer for point-in-time full/partial export and automatic snapshots, including folded external chat/plugin/MCP rows without monolithizing state in memory. |
+| `server/node/backup/streamRisuLoad.cjs` | Bounded streaming inspector/decoder for supported RisuSave formats and snapshot/import ingestion. |
+| `server/node/backup/streamJsonToMsgpack.cjs`, `jsonValidateWorker.cjs` | Bounded JSON validation and streaming conversion used by import/restore compatibility paths. |
+| `server/node/backup/backupEntryFormat.cjs` | Archive header/framing, entry name/body bounds, byte-size planning, and preflight. |
+| `server/node/backup/importSpool.cjs` | Private bounded upload/file/ZIP ingress, central-directory/CRC validation, entry staging, cancellation, and cleanup. |
+
+#### `chat/`
+
+| File | Role and important symbols |
+|---|---|
+| `server/node/chat/chatRows.cjs` | Injected chat-row store and the monolith-ingestion boundary. It owns encoded chat keys, missing/duplicate-ID repair, stub semantics, referenced-row diff/sweep helpers, split/assembly, and the transactional `ingestFullDatabase()` and `ingestStreamingDatabase()` paths. Duplicate `chaId` repair happens before row keys are finalized. |
+| `server/node/chat/characterDefaults.cjs` | Loads `shared/character-defaults-policy.json` and applies its nullish character defaults and missing character/persona/preset ID rules during migration and both monolith-ingest paths. |
+| `server/node/chat/chatDelta.cjs` | Defines and validates the v1 chat-operation envelope and restricted message JSON Patch, then applies a validated delta without weakening base/result commitments. |
+| `server/node/chat/chatBackups.cjs` | Per-chat pre-image history. Ordinary overwrites are best-effort and enforce a 45-second per-chat cooldown; structural chat deletion forces a cooldown-exempt capture and fails closed. Reconciliation streams each loose version into an atomic, self-describing `.frame` containing one independent gzip member, enforces the exact 125-version default plus a 256 MiB per-chat uncompressed-byte default, applies the separate globally age-ordered compressed-disk budget, and restores exact raw bytes by inflating only the selected frame. Legacy solid v1 bundles remain readable and migrate through bounded one-pass extraction without becoming authoritative until every replacement is durable. |
+| `server/node/chat/bufferedIngress.cjs` | Pre-parser admission for buffered JSON, octet-stream, and text bodies, plus identity-only admission for bodyless/direct-stream writers. It resolves auth/writer/route-limit policy, rejects retired protocols and mismatched client builds before reading a body, strictly validates uncompressed `Content-Length`, and reserves/relinquishes the process-wide in-flight byte budget without performing a writer-lock transition. |
+| `server/node/chat/admittedIngressSpool.cjs` | Post-admission disk ingress for raw `/api/write` and raw/JSON chat-row writes. It consumes the already-reserved request in bounded pages, fsyncs a private spool in the installation-owned configured-spool namespace, preserves the reservation through response finish/close, and maps spool-volume pressure to the admission layer's retryable refusal. |
+
+#### `db/`
+
+| File | Role and important symbols |
+|---|---|
+| `server/node/db/db.cjs` | Opens `save/risuai.db`, applies SQLite pragmas, owns KV/delta-list primitives, pins read-only WAL snapshots, initializes chunks, and maintains derived plugin usage/owner indexes and atomic quota plans. |
+| `server/node/db/chunkStore.cjs` | Protected content-defined storage for the live DB, automatic snapshots, chat rows, and plugin values. It owns manifest metadata/publications, logical size/SHA verification, bounded raw-row streaming, snapshot sharing/cost, and mark/sweep GC. |
+| `server/node/db/chunkPlan.cjs`, `chunkPlanWorker.cjs` | Bounded worker-thread preparation for private file sources. At most two workers by default scan FastCDC boundaries and compute per-chunk SHA-256 plus logical SHA-256/MD5 in one bounded-window pass; queued publication validates the immutable file identity and exact planned bytes. |
+| `server/node/db/atomicJsonPatch.cjs` | Copy-on-write RFC 6902 application for the retained decoded database. `applyPatchAtomic()` clones only mutation paths so a failed patch cannot partially mutate the live cache while untouched branches retain reusable identity. |
+| `server/node/db/generationMemo.cjs` | Generation-bound derived-value memo with process-unique generation tokens, used for canonical database encodings, hashes, and ETags without ABA reuse after cache replacement. |
+| `server/node/db/maintenanceRoutes.cjs` | Storage dashboard and database maintenance routes: `/api/db/stats` (+`/characters`, `/modules`), `/api/db/optimize`, `/api/db/durability` GET/PUT, `/api/db/wal-checkpoint`, non-restore `/api/db/snapshots` (limits/list/delete), and `/api/assets/cleanup`. The durability/WAL engine and snapshot-limit persistence/rotation stay in `server.cjs`; destructive snapshot restore is registered immediately afterward from `backupRoutes.cjs`. Mutations cross only through named server-side wrappers such as `persistSqliteDurabilityMode()`, and mutable paths/ETag are read through getters at request time. |
+| `server/node/db/stageRowDownload.cjs` | Opens one validated read-only descriptor for a staged plugin transition row and streams from that same descriptor, avoiding a validation/reopen race. |
+| `server/node/db/dbCachedRead.cjs` | Server half of the optional segmented boot-read protocol. It validates the client's hash inventory, splits the stubs-only database into root/character/preset/module/persona MessagePack segments, and emits bytes only for cache misses while preserving the full-view ETag. |
+| `server/node/db/databaseRevision.cjs`, `revisionBoundCache.cjs` | Transactional generation tracking and bounded decoded-cache reuse for `database.bin`. SQLite triggers advance a monotonic operational revision on insert, key/value update, and delete; clean decoded entries are revision-checked and LRU/size/heap-pressure evictable, while acknowledged dirty patch state remains pinned until persistence or explicit invalidation. |
+| `server/node/db/dbCachePersistence.cjs` | Synchronous core of dirty database-cache persistence, extracted from `persistDbCacheGeneration()`: graph guards (`findStubFlagLossChats`, duplicate chat IDs), plugin externalization, canonical encoding, and the single commit transaction. `runEmergencyDbFlush()` is the guarded fatal-exit variant: it skips on import, owned transaction, no pending work, stale/empty/non-normalized cache, or guard rejection, and never deletes chat rows because pre-image capture is asynchronous. |
+| `server/node/db/listDelta.cjs` | Builds full or delta `/api/list` responses from KV modification timestamps, the deletion journal, filesystem mtimes, and the list epoch. Delta eligibility is capped at six days. |
+
+#### `plugin-storage/`
+
+| File | Role and important symbols |
+|---|---|
+| `server/node/plugin-storage/pluginStorageRoutes.cjs` | All `/api/plugin-storage/*` routes (clear, state, viewer, manifest, reconcile-boot, recovery, batch, mutate, staged/bulk/legacy transitions) plus their family-only helpers, registered through six position-preserving calls sharing one memoized per-app family. The publication engine — manifest read/write/generation, publication readers, session read-state, recovery-snapshot hooks, spool/stage lifecycle, and stream-limit constants — stays in `server.cjs` and crosses via ctx; `dbEtag` mutations go through the server-side `ensurePluginStorageTransitionDbEtag()`/`publishPluginStorageTransitionDbState()` wrappers. |
+| `server/node/plugin-storage/pluginStorageManifestCache.cjs` | Revision-bound parsed manifest cache. It reuses exact value/meta key membership and hashed-key mappings, prepares ordered deltas, and publishes a prepared cache entry only for the committed plugin-publication revision. |
+| `server/node/plugin-storage/pluginSaveKeys.cjs` | Canonical optimized-plugin prefixes, manifest/folded markers, and lossless physical-key policy: UTF-8/base64url, tagged ill-formed UTF-16, or manifest-v3-mapped archive-safe hashes. |
+| `server/node/plugin-storage/pluginStorageJson.cjs`, `pluginStorageLimits.cjs` | Strict and lossless plugin-row codecs, key/row validation, and authoritative per-value and aggregate optimized-storage limits. `lossless-json-v1` is distinguished by the `PRISUL01` frame magic; metadata remains strict-JSON-only. |
+| `server/node/plugin-storage/pluginStorageViewerFacets.cjs` | Trigger-revisioned display-size and owner facets for plugin viewer paging. Live writes maintain current facets transactionally; pinned readers can reuse only an index matching the exact source revision, otherwise routes rebuild it. |
+
+#### `runtime/`
+
+| File | Role and important symbols |
+|---|---|
+| `server/node/runtime/session-lock.cjs` | In-memory single-writer authority. `register()` records a boot without stealing; `checkWrite()` distinguishes the active writer, fresh gesture-backed takeover, fresh passive compatibility writes, stale or boot-epoch rejection; `peek()` provides a side-effect-free foreground status. |
+| `server/node/runtime/boundedSessionState.cjs` | Bounded LRU state for per-browser protocol pins. The server uses `createBoundedSessionState()` to retain at most 50 session-scoped plugin-publication read states independently of writer authority. |
+| `server/node/runtime/buildStamp.cjs` | Loads and validates `dist/build-stamp.json` for writer-mutation admission. `readClientBuildStamp()` returns `null` and logs a warning on any read, parse, or shape failure, deliberately disabling the build check rather than blocking the server. |
+| `server/node/runtime/model-jobs.cjs` | Durable upstream model relay. `createModelJobs()` stores non-secret job metadata in `save/model-jobs.db`, records exact provider response bytes in append-only journals under `save/model-jobs/`, tails running streams, supports claims, and owns 48-hour pending-send tombstones. Main jobs are recoverable; auxiliary pipeline requests are relay-only. |
+| `server/node/runtime/logs.cjs` | Separate SQLite-backed client/server diagnostic log sink in `save/logs.db`. It masks credentials, batches writes, builds the server logger, installs fatal process handlers (accepting an `onFatalExit` callback that `server.cjs` wires to the emergency database flush), and records otherwise-unlogged Express errors. This is distinct from provider request history and usage in `request-logs.cjs`. |
+| `server/node/runtime/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
+| `server/node/runtime/request-trace.cjs` | Opt-in whole-exchange debug tracing. `createRequestTracer()` captures only completed non-streaming HTTP exchanges, writes atomic gzip files under `save/trace`, and retains the newest 500 without affecting request handling on trace failures. |
+| `server/node/runtime/selfUpdate.cjs` | Public-stats, update-check, and portable self-update routes via `registerSelfUpdateRoutes(app, ctx)`. Owns deployment-type detection, release/asset resolution, and the in-process recovery-path state-lock tail (`withLocalRecoveryPathStateLock()`); exports `isSelfUpdateInProgress()` and the recovery-path test gate, which `backupRoutes.cjs` uses directly so backup-path changes and self-update serialize on one queue. |
+| `server/node/runtime/proxy.cjs` | Reverse-proxy (`/proxy`, `/proxy2`), Hub proxy, and local proxy-stream-job routes via `registerProxyRoutes(app, ctx)`. Owns the job map/lifecycle, target sanitation for stream jobs, and the job WebSocket; exports `checkProxyAuth` (reused by model-jobs registration), `setupProxyStreamWebSocket(server)` (attached by both HTTP/HTTPS boot branches), and `startProxyStreamJobGc()` (called beside `backupRoutes.cjs`'s `startPartialExportJobGc()` in the boot IIFE). Target allow-policy itself stays in `runtime/proxyTarget.cjs`. |
+| `server/node/runtime/observability.cjs` | Client/server log routes (`/api/logs`), `/api/storage/capacity`, and `/api/storage/list-sizes` through position-preserving `registerStorageCapacityRoute`/`registerStorageListSizesRoute`/`registerLogRoutes` calls. Thin wrappers over `runtime/logs.cjs` and `db/db.cjs`; auth, import-barrier access, and disk-space checks cross from `server.cjs` through ctx. |
+
+#### Coverage anchors
+
+| File | Role and important symbols |
+|---|---|
+| `server/node/backup/backupSnapshot.test.ts`, `test/compat/export-concurrent-mutation.test.ts` | Prove pinned snapshot reads survive live updates/deletes, missing referenced chats abort exports, concurrent plugin changes cannot corrupt archive framing, and completed exports re-import exactly. |
+| `server/node/backup/importBarrier.test.ts`, `server/node/backup/importJournal.test.ts`, `test/compat/import-mutation-barrier.test.ts` | Cover hold-before-drain ordering, retryable mutation refusal, late import rollback, crash recovery for directory swaps, and list-epoch invalidation. |
+| `server/node/plugin-storage/snapshotPluginStorage.e2e.test.ts`, `test/compat/snapshot-spool.test.ts` | Cover exact optimized-plugin recovery (including folded-empty/pre-marker cases), chunk-streamed snapshot writes, save-volume spooling, orphan cleanup, and non-fatal snapshot-only failures. |
+| `server/node/chat/bufferedIngress.test.ts`, `server/node/runtime/session-lock.test.ts`, `server/node/runtime/model-jobs.test.ts`, `server/node/runtime/request-logs.test.ts` | Cover pre-parser admission/limits/concurrent byte accounting, writer registration/takeover/restart fencing, recoverable versus auxiliary job lifecycle and retention, journal streaming/security, pending sends, request masking/truncation/rotation, usage retention, route guards, and database closure. Real-server ingress ordering and abort release are covered by `test/compat/buffered-ingress-admission.test.ts`. |
 
 ### Hono scaffold
 
@@ -127,6 +175,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `POCKETRISU_ASSET_GC_AUTO` | Set to `0` to disable automatic sweeps or `1` to force-enable them in test environments. The authenticated `/api/assets/cleanup` maintenance endpoint remains available. |
 | `POCKETRISU_ALLOW_INSECURE_CONTEXT` | Allows client boot outside HTTPS or localhost only when exactly `1` or `true`; bypasses the WebCrypto integrity gate at the operator's risk. |
 | `TRACE_REQUEST_FOR_DEBUG` | When exactly `true`, enables whole-exchange debug traces and injects the frontend plugin-storage diagnostic flag. See [request logging and observability](#request-logging-and-observability). |
+| `POCKETRISU_QUEUE_DIAG` | When exactly `true`, instruments the storage FIFO by operation label and registers authenticated `GET /api/debug/queue-diag`. It is off by default. |
 | `POCKETRISU_HUB_HOSTING` | Enables shared/multi-instance hub hosting when set to `TRUE`/`true` or `1`. It hides host-disk statistics from `/api/db/stats`, disables the file-based server-backup feature with `403` responses, and pins the snapshot retention byte cap to `POCKETRISU_HUB_SNAPSHOT_CAP_MB` (only the snapshot count stays adjustable). |
 | `POCKETRISU_HUB_SNAPSHOT_CAP_MB` | Hub-mode snapshot byte cap in MB, applied to both the limits endpoints and trim rotation; unset or invalid falls back to 500 MB, clamped to the 10 MB–50 GB safety bounds. Ignored outside hub mode. |
 | `POCKETRISU_SQLITE_DURABILITY_MODE` | Administrator-managed SQLite durability policy: `durable`, `balanced`, or `performance`. Invalid values fail safe to `durable`. Any explicit value locks the System-dashboard control; hub mode is always administrator-managed and defaults to `durable` when unset. |
@@ -172,9 +221,16 @@ write timestamp; a different session can take over only if it booted after the a
 writer's last accepted write and sends recent-user-activity proof. A fresh passive write
 is accepted without moving or refreshing the lock, preserving boot/keepalive
 compatibility. A stale session receives HTTP 423, while clients that omit `x-session-id`
-remain compatibility-exempt. `GET /api/session/lock-status` calls side-effect-free
-`peek()` and never acquires authority. Lock state is in memory, so the first registration
-or write after a server restart becomes active.
+remain ownership-compatibility-exempt unless they present a stale epoch. `GET
+/api/session/lock-status` calls side-effect-free `peek()` and never acquires authority.
+
+`createSessionLock()` also generates a random 256-bit writer epoch at each server boot.
+Every `/api/*` response exposes it as `x-writer-epoch`; `/api/session` and the lock-status
+response include `writerEpoch`, and epoch-aware clients echo it on later requests. A
+client presenting a non-empty epoch from an earlier boot is stale even though the
+in-memory active-writer map reset, so its mutation receives HTTP 423
+`SESSION_DEACTIVATED`. Omitting the epoch preserves the legacy restart gap: the first
+registration or write after restart can become active.
 
 Session-scoped plugin read pins are separate from that writer lock.
 `pluginStorageReadStateBySession` uses `createBoundedSessionState()` as a 50-entry LRU;
@@ -237,8 +293,11 @@ inside `queueStorageMutation()` immediately before the transactional publication
 │   │   ├── <name>                     # one file per portable safe-named assets/* key
 │   │   └── .migrated_to_fs
 │   ├── inlays/
-│   │   ├── <id>.<ext>                 # image/signature payload
-│   │   ├── <id>.meta.json             # type, extension, name, dimensions
+│   │   ├── .inlay-objects-v1/
+│   │   │   ├── payload/i/<id-hex-chunks>/e/<ext-hex-chunks>/data
+│   │   │   └── sidecar/i/<id-hex-chunks>/meta.json
+│   │   ├── <id>.<ext>                 # optional legacy compatibility input
+│   │   ├── <id>.meta.json             # optional legacy compatibility sidecar
 │   │   └── .migrated_to_fs
 │   ├── chat-backups/
 │   │   └── <chaId>/<chatId>/           # encoded path components
@@ -262,6 +321,11 @@ inside `queueStorageMutation()` immediately before the transactional publication
     ├── server.key
     └── server.crt
 ```
+
+Each `<id-hex-chunks>` or `<ext-hex-chunks>` placeholder is one or more lowercase-hex
+UTF-8 path components, each at most 120 characters. Payload and sidecar leaves are
+therefore disjoint even for hostile IDs/extensions; root-level legacy files are not
+current publication targets.
 
 `risuai.db` contains:
 
@@ -381,6 +445,11 @@ plan.
   ETag to the winner and a definitive 409 without mutation to losing concurrent creators;
   a losing bootstrap rereads the winner's database.
 - `/api/read` and `/api/db/read-cached` serialize pending-patch flush plus live-row selection through the storage FIFO. They reuse the stubs-only decoded graph only when its trigger-backed SQLite row revision still matches, otherwise they decode, normalize, and replace the clean cache entry. `/api/read` sends the legacy-encoded stripped database plus `x-db-etag`; if a full chat payload or folded optimized plugin storage leaked into the live row, defensive `ingestDatabase()` recovery advances the revision and the selector retries. Clean entries are bounded by entry count, estimated bytes, per-entry size, and V8 heap pressure; dirty acknowledged patch entries are never evicted.
+- `/api/db/stats/characters` and `/api/db/stats/modules` call the same
+  `prepareLiveDatabaseRead()` selector with full-blob encoding disabled. They therefore
+  reuse a decoded graph only at the exact live `database.bin` revision and repopulate the
+  bounded cache on a miss instead of independently decoding the row for each dashboard
+  request.
 - `POST /api/plugin-storage/reconcile-boot` derives the selected row's raw MD5 and, when
   needed, its canonical normalized legacy-view MD5 inside one queued storage operation.
   Cache-off and segmented boots may therefore present different but equivalent tokens;
@@ -401,6 +470,11 @@ plan.
   stream from one already-open read-only descriptor. Validation and delivery therefore
   cannot observe two different row files through a size-check-then-reopen race.
 - Monolith-shaped inputs from boot migration, backup/snapshot restore, save-folder import, or defensive route recovery pass through `ingestDatabase()`. Supported raw or gzip/zlib MessagePack inputs above `RISU_STREAM_INGEST_MIN_BYTES` route to `ingestStreamingDatabase()`: the walker retains byte offsets for the root and character fields, decodes one chat at a time, and writes chat rows plus the stripped DB in one transaction without constructing or persisting the full monolith. Missing-ID assignment, duplicate handling, orphan-folder normalization, stub projection, cold-storage restoration, stale-row sweeping, and optimized plugin splitting share the same semantics as `ingestFullDatabase()`. Legacy block saves, bare deflate/JSON fallbacks, and unsupported compressed payloads retain the in-memory decoder.
+- Before either monolith-ingest path finalizes chat rows and the stripped database,
+  `chatRows.cjs` calls `applyDatabaseCharacterDefaults()` from
+  `chat/characterDefaults.cjs`, applying `shared/character-defaults-policy.json` to
+  missing character fields and character/persona/preset IDs. The policy semantics are
+  owned by [presets and profiles](presets-profiles.md).
 - The HTML root injects `globalThis.__NODE__`, `globalThis.__PATCH_SYNC__`, and
   `globalThis.__ALLOW_INSECURE_CONTEXT__`; it also sets
   `globalThis.__PLUGIN_STORAGE_DIAG__` from the debug-tracing gate. `src/ts/platform.ts`
@@ -423,6 +497,11 @@ plan.
   rolled back with) the import transaction. Outside the import owner's already-exclusive
   transaction, KV/chat-row/asset writes must use `queueStorageMutation()`, never
   `queueStorageOperation()` directly.
+- With `POCKETRISU_QUEUE_DIAG=true`, the same FIFO records per-label operation counts,
+  total and maximum queue wait/hold milliseconds, and a bounded 512-operation reservoir
+  sample used for wait/hold p50 and p95. Authenticated `GET /api/debug/queue-diag`
+  returns the snapshot, and graceful `SIGTERM` prints the per-label summary. The route and
+  timing overhead do not exist when the gate is off.
 
 #### Hash-verified resource cache and key-list reads
 
@@ -452,7 +531,10 @@ plan.
   Runtime chat bodies are never retained in a server-wide in-memory map.
 - `GET /api/chat-content/:chaId/:chatIndex` resolves the `x-chat-id` row directly when
   supplied, otherwise falls back through the stripped database's index and rejects an ID
-  mismatch with 409. A log-free warm row remains one protected raw read. A row with a log
+  mismatch with 409. The index fallback first reuses the exact-revision decoded database
+  cache (including current acknowledged dirty state); on a cache miss it flushes pending
+  state and calls `prepareLiveDatabaseRead()` with full-blob encoding disabled. A log-free
+  warm row remains one protected raw read. A row with a log
   replays its bounded whole-message operations on demand, legacy-encodes once, and verifies
   the exact materialized SHA-256/length against `chat_row_metadata`; the 64-operation or
   1 MiB defaults bound this work until queued compaction. Async protected reads bind base
@@ -474,6 +556,12 @@ plan.
   acknowledging the row and never joins the five-second database debounce. During active
   generation the client row stage writes the first eligible dirty save, throttles later
   checkpoints to 20 seconds, and always queues a final idle save.
+- Full-row writes with an acknowledged base carry `x-chat-base-hash`. Immediately before
+  either the spooled or buffered publication, the server compares it with the current
+  materialized row digest; a mismatch returns HTTP 409 `CHAT_ROW_BASE_MISMATCH` with a
+  definitive not-committed outcome. Omitting the header remains legacy-compatible. This
+  full-row precondition is separate from the operation log's base/result commitments
+  described below.
 - The same route accepts `application/vnd.pocketrisu.chat-delta+json` without the full-row
   spool. Its exact v1 schema is `{version, baseHash, resultHash, resultSize, patch}`. The
   normalized patch is non-empty, at most 1,024 operations and just under the existing
@@ -519,14 +607,17 @@ plan.
   never dispatched. Its acknowledgement parser requires the exact response/result schema;
   malformed, reordered, incomplete, contradictory, or body-lost responses remain
   `COMMIT_OUTCOME_UNKNOWN` instead of collapsing prior outcomes into generic failure.
-- Inlays are migrated from legacy `inlay/*` KV JSON to `save/inlays/<id>.<ext>` plus a
-  sidecar by `migrateInlaysToFilesystem()`.
-- `writeInlayFile()` stages and fsyncs both payload and sidecar, atomically renames and
-  directory-syncs the payload first, then publishes the sidecar as the extension-change
-  commit point. Only afterward may it remove the old-extension payload. A pre-commit
-  failure rolls back the newly exposed extension while the old sidecar remains
-  authoritative; startup `reconcileInterruptedInlayPublications()` removes recognized
-  temporary files before migration resumes.
+- `migrateInlaysToFilesystem()` converts legacy `inlay/*` KV JSON and canonicalizes any
+  root-level `save/inlays/<id>.<ext>` plus `<id>.meta.json` compatibility inputs into the
+  versioned `.inlay-objects-v1` payload/sidecar namespace. New `writeInlayFile()` and
+  `writeInlayFileFromFile()` publications target only that namespace; startup first runs
+  `reconcileInterruptedInlayPublications()` and canonicalizes leftover flat inputs.
+- Inlay writes stage and fsync both payload and sidecar, atomically rename and
+  directory-sync the canonical payload first, then publish the canonical sidecar as the
+  extension-change commit point. Only afterward may they remove the old-extension payload
+  or legacy flat inputs. A pre-commit failure rolls back the newly exposed extension while
+  the old sidecar remains authoritative; startup removes recognized temporary files before
+  migration resumes.
 - Legacy key/value APIs synthesize the old JSON payload through
   `readInlayAssetPayload()`.
 - `POST /api/inlays/delete-unreferenced` accepts at most 1,000 safe IDs (and at most
@@ -653,6 +744,7 @@ are sent to the ordinary application log; it adds no provider API.
 | Key/value storage | `GET /api/read`, raw recovery `GET /api/db/read-raw-for-boot`, segmented `POST /api/db/read-cached`, create-only `POST /api/db/create-if-absent`, `GET /api/remove`, full/delta `GET /api/list`, `POST /api/write`, `POST /api/patch`, and cookie-authenticated `POST /api/db/flush`. | `NodeStorage`, bootstrap, and the save loop. |
 | Plugin storage | Boot reconcile; proof-bound recovery inspection/download/resolve; state, viewer-page, manifest, mutate, batch, clear, capacity/size; consolidated `/api/plugin-storage/transition/bulk`; and staged begin/upload/row/status/finalize/abort routes. Manifest reads in `state` mode explicitly send `Cache-Control: no-store`. The retired direct `/api/plugin-storage/transition` remains registered only as a pre-body `426 CLIENT_UPGRADE_REQUIRED` rejection. Generic KV routes guard the reserved publication roots. | `NodeStorage`, `persistentKv.ts`, `pluginSaveStorage.ts`, bootstrap, and Plugin Settings/Viewer. |
 | Asset serving/bulk | `GET /api/asset/:hexKey`, `POST /api/assets/bulk-read`, ordered per-entry/idempotent `POST /api/assets/bulk-write`, and maintenance `POST /api/assets/cleanup`. | Direct URLs from `src/ts/globalApi.svelte.ts`; bulk methods and System dashboard. |
+| Queue diagnostics | When `POCKETRISU_QUEUE_DIAG=true`, authenticated `GET /api/debug/queue-diag` returns per-label storage-FIFO count, wait/hold totals and maxima, and p50/p95 reservoir-sample statistics. The route is absent when disabled. | Operator diagnostics; no built-in frontend caller. |
 | Diagnostic logs | `POST /api/logs` ingests client batches, `GET /api/logs` filters/paginates, and writer-guarded `DELETE /api/logs` clears. | Batch uploader in `src/ts/log.ts`; settings queries in `SystemSettings.svelte`. |
 | Provider request logs | `POST/GET /api/request-logs`, `GET /api/request-logs/usage`, `/stats`, and `/:id`, plus writer-guarded `DELETE /api/request-logs` with optional usage deletion. See [request logging and observability](#request-logging-and-observability). | `src/ts/requestLog.ts` and request-log/statistics settings UI. |
 | Portable backup | Strict full/upstream/main `GET /api/backup/export`, bounded import preparation/streaming, and cancellable partial-export job create/status/delete/download routes under `/api/backup/export/jobs`. | `NodeStorage` and `backuplocal.ts`; see [Backup and recovery](backup-recovery.md). |

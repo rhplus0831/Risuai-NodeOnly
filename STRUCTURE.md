@@ -2,7 +2,7 @@
 
 Navigation map for developers and AI agents. Start here, choose the owning subsystem,
 then use the change maps and symbol names in `docs/structure/`. Ownership and runtime
-behavior were audited on 2026-08-04 against `95c2ea30`. File paths and symbols are the
+behavior were audited on 2026-08-09 against `e2f6d2ea`. File paths and symbols are the
 durable references; line-number hints in the detail docs are approximate and should be
 confirmed with `rg`.
 
@@ -46,6 +46,7 @@ Pushes to `serve`, pull requests into `main`, and the tag-driven release and Doc
 workflows all run the same CI gate (`.github/workflows/tests.yml`): svelte-check,
 build, both unit suites, and the compatibility suite. The gate fails on compat cases
 skipped outside the known fixture-gated allowlist in `scripts/check-compat-skips.mjs`.
+The Playwright E2E trace suite is outside this reusable gate.
 
 | Command | Purpose |
 |---|---|
@@ -55,9 +56,11 @@ skipped outside the known fixture-gated allowlist in `scripts/check-compat-skips
 | `pnpm runserver` | Start Express from the repository root; serves `dist/` on `$PORT` (default 6001), binding `$HOST` when set and otherwise all interfaces |
 | `pnpm check` | Svelte and TypeScript diagnostics |
 | `pnpm check:help` | Validate localized help-key coverage |
+| `pnpm check:docs` | Validate documentation links and the generated findings work index |
 | `pnpm test` | Browser/client unit tests under `src/` in happy-dom, followed by the server unit suite |
 | `pnpm test:server` | Node server unit tests with real `better-sqlite3` |
 | `pnpm test:compat` | Real-server storage/interchange integration tests: imports, exports, atomicity, caches, plugin storage |
+| `pnpm test:e2e` | Playwright E2E trace harness against the built app and isolated real servers; requires a current build and is outside the CI gate |
 | `pnpm test:performance` | Isolated performance suite, run with resource cache disabled and enabled |
 | `pnpm test:performance:extreme` | Opt-in 448 MiB plugin transition stress test targeting roughly 2 GiB peak RSS; performs memory/disk preflight and never runs from the default performance command |
 
@@ -69,19 +72,26 @@ tests PocketRisu persistence and interchange behavior, not execution inside upst
 
 ```text
 Browser client (src/)                         Node server (server/node/)
-┌───────────────────────────────┐   HTTP/WS   ┌──────────────────────────────────┐
-│ index.html → src/main.ts      │ ─────────── │ server.cjs (Express)             │
-│ → App.svelte + loadData()     │  /api/*     │ ├ SQLite KV + protected chunks   │
-│ stores/runes select screens   │  /proxy2    │ ├ chats/* + pluginsave/* rows    │
-│                               │  WS jobs    │ ├ assets/inlays/history files    │
-│ DBState.db holds placeholders │             │ ├ admitted spools + chunk workers│
-│ NodeStorage-backed, KV-shaped │             │ └ pins/backups/plugin recovery   │
-│ server API + codec worker     │             │ model-jobs.db + request journals │
-│ optional verified IDB cache   │             │ request-logs.db + save/logs.db   │
-└───────────────────────────────┘             │ opt-in save/trace                │
-                                              └──────────────────────────────────┘
+┌───────────────────────────────┐   HTTP/WS   ┌────────────────────────────────────────┐
+│ index.html → src/main.ts      │ ─────────── │ server.cjs (Express composition root)  │
+│ → App.svelte + loadData()     │  /api/*     │ ├ subsystem route/storage modules      │
+│ stores/runes select screens   │  /proxy2    │ ├ SQLite KV + protected chunks         │
+│                               │  WS jobs    │ ├ KV row keys: chats/*, pluginsave/*   │
+│ DBState.db holds placeholders │             │ ├ assets/inlays/history files          │
+│ NodeStorage-backed, KV-shaped │             │ ├ admitted spools + chunk workers      │
+│ server API + codec worker     │             │ └ pins/backups/plugin recovery         │
+│ optional verified IDB cache   │             │ model-jobs.db + request journals       │
+└───────────────────────────────┘             │ request-logs.db + save/logs.db         │
+                                              │ opt-in save/trace                      │
+                                              └────────────────────────────────────────┘
 ```
 
+- `server/node/server.cjs` remains the Express composition root. It keeps some
+  asset/chat endpoints inline and wires subsystem modules under
+  `server/node/{assets,backup,chat,db,plugin-storage,runtime}/`. Extracted route
+  families include `backup/backupRoutes.cjs`, `db/maintenanceRoutes.cjs`,
+  `plugin-storage/pluginStorageRoutes.cjs`, and
+  `runtime/{proxy,observability,selfUpdate,model-jobs}.cjs` beneath that root.
 - The browser holds the whole `Database` proxy in `DBState.db`. Unopened chats are
   runtime `_placeholder` objects; full bodies hydrate lazily. Database persistence
   replaces every chat with a wire `_stub` and saves authoritative chat rows first.
@@ -114,13 +124,15 @@ Browser client (src/)                         Node server (server/node/)
 | `src/lang/`, `src/etc/docs/` | UI translations and embedded help content |
 | `server/node/` | Production Express backend and storage/recovery modules |
 | `server/hono/` | Incomplete multi-runtime scaffold |
-| `shared/` | Contracts consumed by both client and server, currently plugin key policy |
+| `shared/` | Client/server plugin-key and character-defaults JSON contracts |
 | `docs/structure/` | This architecture guide's subsystem references |
+| `docs-human/` | Localized human-facing installation, migration, and operator guides |
 | `docs/findings/` | Current owner-grouped findings, accepted decisions, and active remediation programs; start at `docs/findings/README.md` |
 | `.archived-docs/` | Completed audit programs, fixed reports, and superseded source evidence; start at `.archived-docs/README.md` |
 | `test/compat/` | Real-server integration and storage/interchange regressions |
+| `test/e2e/` | Playwright trace/budget scenarios against the built app and isolated real servers |
 | `test/performance/` | Resource-cache and storage performance scenarios |
-| `scripts/` | Portable/Termux build helpers, updater, and verification scripts |
+| `scripts/` | Portable/Termux build, updater, verification, asset-dedup, and recovery-lock helpers |
 | `public/` | Static files copied into the frontend build |
 | `util/` | Legacy/upstream userscript support; not part of the PocketRisu runtime |
 
@@ -205,9 +217,10 @@ export process chat JSON incrementally instead of materializing every chat row a
 ### Client/server storage protocols
 
 - Chat metadata allowlists, patch normalization/hashing, and RisuSave constants have
-  coordinated client/server implementations. The plugin key policy is centralized in
-  `shared/plugin-save-key-policy.json`; other paired contracts still require lockstep
-  changes.
+  coordinated client/server implementations. Shared JSON contracts centralize plugin
+  key rules in `shared/plugin-save-key-policy.json` and character defaults/ID rules in
+  `shared/character-defaults-policy.json`; server database ingest applies the latter
+  before chat-row publication. Other paired contracts still require lockstep changes.
 - Browser caches are non-authoritative. Cache hits, segmented DB assembly, and list deltas
   must fall back to a full authoritative read on malformed, missing, stale, or
   unverifiable state.

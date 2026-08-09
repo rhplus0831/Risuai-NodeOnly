@@ -1,7 +1,7 @@
 # Client storage
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-09 against `e2f6d2ea`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -61,7 +61,7 @@ Relevant regression coverage:
 - `src/ts/chatLoadPages.test.ts` covers normalization and defaults (`:10`).
 - `src/ts/storage/resourceCache.test.ts` covers hashing, timeout helpers, cache limits, retention planning, prune thresholds, unsupported IndexedDB, and large database manifests.
 - `src/ts/storage/persistentKv.test.ts` verifies that cached JSON reads use the hash-aware adapter without changing ordinary reads.
-- `src/ts/storage/writerTakeover.test.ts`, `server/node/session-lock.test.ts`, and `test/compat/writer-session-lock.test.ts` cover the explicit takeover choice, foreground deferral during active chat work, fresh gesture-backed takeover, passive fresh writes, stale rejection, and compatibility clients without a session ID.
+- `src/ts/storage/writerTakeover.test.ts`, `server/node/runtime/session-lock.test.ts`, and `test/compat/writer-session-lock.test.ts` cover the explicit takeover choice, foreground deferral during active chat work, fresh gesture-backed takeover, passive fresh writes, stale rejection, and compatibility clients without a session ID.
 - `test/compat/db-cached-read.test.ts` exercises the server half of segmented boot, including ETag parity, all-miss/all-hit projection, generic KV `204` selection, and malformed or oversized inventories.
 - `test/compat/boot-database-negotiation.test.ts` covers atomic first creation and concurrent boot convergence; `test/compat/plugin-storage-boot-reconcile.test.ts` covers equivalent raw/canonical boot ETags and genuine stale conflicts.
 
@@ -113,12 +113,15 @@ Structural/versioned migrations that need broader context live separately in `bo
    Then call `readDatabaseForBoot()`. A server advertising
    `database.rawBootRead` uses the segmented root/characters/botPresets/modules/personas
    read when the resource cache is enabled and the advisory raw database size is at least
-   128 KiB (or unknown); smaller databases bypass IndexedDB inventory verification and use
-   `/api/db/read-raw-for-boot`. The raw route is also used when the cache is disabled, so
-   corrupt authoritative bytes can enter recovery without being hidden by server decoding.
-   The segmented route returns the canonical normalized
-   legacy-view ETag used by `/api/read`; the raw route returns MD5 over the verbatim row
-   bytes. A server without the capability uses legacy `/api/read`; an empty legacy
+   128 KiB (or unknown). When the database KV row is a protected chunk marker, the server
+   advertises its chunk-aware logical `kvSize()` rather than the marker length, so this
+   bypass decision uses the reconstructed database size. Smaller databases bypass IndexedDB
+   inventory verification and use `/api/db/read-raw-for-boot`. The raw route is also used
+   when the cache is disabled, so corrupt authoritative bytes can enter recovery without
+   being hidden by server decoding. The segmented route returns the canonical normalized
+   legacy-view ETag used by `/api/read`; the raw route returns MD5 over the authoritative
+   logical bytes, which are verbatim for ordinary rows and reassembled for protected chunk
+   rows. A server without the capability uses legacy `/api/read`; an empty legacy
    response is accepted as missing only when an uncached `/api/list` also proves that
    `database/database.bin` is absent. An advertised raw route must use explicit HTTP 204
    for absence; 404 and zero-byte 200 responses fail closed.
@@ -243,7 +246,12 @@ When `supportsPatchSync` is enabled (`src/ts/platform.ts:18`):
   untouched. It then reinstalls runtime placeholders with `setDatabase()`, rebuilds the
   encoder, publishes the ETag last, and retries without marking the row stage's stub save
   committed. Dirty branches are the conservative union of the existing reactive/explicit
-  tracker and changes proven by the patch baseline diff.
+  tracker and changes proven by the patch baseline diff. After the network awaits and a
+  reactive `tick`, `ledger.captureAfter(revisionProposal)` captures `lateRevisions`; their
+  `lateDirty` projection joins the local overlay while the live ledger remains untouched.
+  After installing the merged graph and publishing its ETag, `requeueTrackedChanges(toSave)`
+  restores the original captured targets, so both post-capture branches and the original
+  proposal remain queued for the retry.
 - Non-conflict patch rejections such as the chat guard may fall through to an ETag-guarded
   full `database.bin` write. Patch-enabled clients refuse an unversioned full write, and
   an ETag conflict enters the same provisional rebase path.
@@ -288,7 +296,16 @@ adds the client build to session/mutation requests, and marks recent pointer/key
 activity on writes. Registration itself does not claim authority; a mutation-time HTTP
 423 tells the client that this page has been displaced. The server's freshness,
 gesture-backed acquisition, compatibility-client, and lock-transition rules are canonical
-in [Server backend](server-backend.md).
+in [Server backend](server-backend.md#authentication-and-writer-authority).
+
+Chat-row and server-boot fences close two narrower stale-write windows. When an acknowledged
+chat baseline exists, a full-row fallback sends its digest as `x-chat-base-hash`; a
+definitive `CHAT_ROW_BASE_MISMATCH` makes `saveChatContent()` enter writer recovery and
+reject the write rather than replaying the stale row. `/api/session` also establishes the
+server's `x-writer-epoch`, which subsequent fetch and XHR writer requests echo. After a
+server restart, a write carrying the old epoch is rejected with 423; observing the new
+response epoch reloads a provably clean page once, while dirty or indeterminate state enters
+the frozen recovery flow.
 
 A build mismatch follows the same preservation boundary. `clientBuildHandshake.ts`
 automatically reloads a clean page at most once for the advertised server build. If the
@@ -311,6 +328,11 @@ browser, while each full body is a separate `chats/<encodeURIComponent(chaId)>/<
 SQLite KV row. `/api/read` therefore decodes and caches the small stripped row directly;
 monolith imports, snapshots, and backups are split or assembled only at explicit
 boundaries in `server/node/chat/chatRows.cjs`.
+
+`snapshotCurrentChatRow()` in `payloadCodecClient.ts` projects top-level runtime state before
+full-row and checkpoint encoding. Persisted full rows therefore exclude `isStreaming`,
+`activeStreamingDisplayOptimizationMode`, and `_placeholder`; the live chat object is not
+mutated by that projection.
 
 A stub contains only `id`, `name`, optional `lastDate`, `folderId`, `modules`, and `_stub: true` (`src/ts/storage/chatStub.ts:13-20`). At boot, `convertStubsToPlaceholders()` changes it into a type-compatible `Chat` with empty `message`, `note`, and `localLore`, plus `_placeholder: true` (`src/ts/storage/chatStorage.ts:17-30`, `:63-71`). Runtime code therefore normally sees `Chat`, never `ChatStub`.
 
@@ -345,13 +367,24 @@ If the target chat was deleted, recovery has nothing to publish and claims the j
 
 The cache is an opt-in performance layer, separate from server-backed `forageStorage`. `resourceCache.ts` stores immutable wire bytes by SHA-256 plus per-resource manifests in IndexedDB; only its enable flag and one-time announcement live in `localStorage`. Disabling it increments an epoch, waits for queued writes, closes the connection, and deletes the database.
 
-Three protocols consume it:
+The main cache protocols are:
 
 - Boot splits the stubs-only database into `root`, individual `characters`, `botPresets`, `modules`, and `personas`. The client advertises up to 8,192 verified hashes, reconstructs a MessagePack envelope from hits/misses, and validates exact shape and ETag. Verified resident bytes and admitted misses share the 64 MiB/32,768-entry boot staging budget; a miss beyond the remaining aggregate or 32 MiB per-value limit is decoded without cache hashing or retention. Once validation succeeds, boot returns the database while donated miss buffers persist in the background and are released after their IndexedDB `put`.
-- Chat and optimized `pluginsave/*` reads advertise recent verified hashes and accept a `204` only when `x-content-hash` names an advertised, locally present, re-hashed entry.
+- Ordinary asset helpers `readImage()` and `loadAsset()`, plus cached optimized
+  `pluginsave/*` JSON reads, route through `getItemCached()`. It advertises recent verified
+  hashes and accepts a `204` only when `x-content-hash` names an advertised, locally present,
+  re-hashed KV entry; anomalies retry an unconditional authoritative read.
+- Chat reads use the corresponding manifest/hash protocol and the same verified-`204`
+  requirement.
 - Successful plugin/chat writes compare the server-returned hash with the exact logical
   bytes prepared by the codec worker before seeding the cache; delta uploads seed those
   same materialized bytes even though only the patch crossed the network.
+
+High-fanout callers also batch reads instead of issuing client-side N+1 requests.
+`readPersistentJsonBulk()` chunks storage keys into 5,000-key `getItems()` requests, while
+`getInlayMetasBatch()` fetches `inlay_meta/*` rows together and skips malformed entries on
+its best-effort path. `NodeStorage.getItems()` consumes the binary bulk-read response with a
+JSON/base64 compatibility fallback.
 
 Retention is deliberately bounded and best-effort: 512 manifests, four ordinary hashes
 per manifest, up to 8,192 hashes in a database manifest, 32,768 entries, 64 MiB total, and
@@ -441,6 +474,8 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 - `jobRecovery.ts` calls the durable `/api/model-jobs` discovery, journal, and claim routes; request logging is published only after its chat-row save succeeds.
 - `server/node/server.cjs` owns SQLite persistence, ETags, session locking, chat-row routing, backup framing, and the server-side copies of chat guards; `server/node/chat/chatRows.cjs` owns split/assembly and row semantics.
 - Browser WebCrypto and IndexedDB back `resourceCache.ts`; `server/node/db/dbCachedRead.cjs` is its database-segmentation counterpart, while server `x-content-hash`/`x-cached-hashes` handling covers KV/chat entries.
+- Server stats and headerless chat-content fallback reads reuse the revision-bound decoded
+  database cache; [Server backend](server-backend.md) owns that mechanism.
 - `streamSaver` is used for large streamed downloads in `backuplocal.ts` and
   `globalApi.svelte.ts`.
 

@@ -1,7 +1,7 @@
 # Media and translation
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-09 against `e2f6d2ea`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -198,21 +198,11 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 
 - `server/node/server.cjs` — relevant storage code is distributed through the server.
 
-  - Current inlays are stored below the versioned
-    `save/inlays/.inlay-objects-v1/{payload,sidecar}` namespace. Logical IDs and
-    normalized extensions are encoded as lowercase UTF-8 hex and split into bounded
-    120-character path components. Payloads use
-    `payload/i/<id chunks>/e/<extension chunks>/data`; sidecars use
-    `sidecar/i/<id chunks>/meta.json`. The fixed marker/file components and disjoint
-    directories make the physical mapping injective for dotted IDs, reserve the
-    metadata namespace, avoid case-fold aliases, and keep every component within
-    portable filesystem name limits. Admission preserves the historical envelope:
-    UTF-8 `id + ".meta.json"` and `id + "." + normalized extension` must each fit
-    the 255-byte legacy filename limit, so sharding cannot create unbounded total
-    path depth for oversized live or imported values. Limits are counted in bytes,
-    not JavaScript characters.
-    `isSafeInlayId()`, `normalizeInlayExt()`, and the canonical path/parser helpers own
-    that contract.
+  - Current inlay payloads and sidecars are stored below the versioned
+    `save/inlays/.inlay-objects-v1/` namespace. Canonical path helpers encode logical IDs
+    and normalized extensions into disjoint, bounded, case-stable components after
+    enforcing the legacy 255-byte tuple envelope. See
+    [Server backend](server-backend.md) for the physical tree.
   - Deployed root-level `<id>.<ext>` and `<id>.meta.json` files remain readable through
     exact parsed-ID compatibility resolution. Canonical files win; sidecar evidence can
     disambiguate a dotted legacy payload such as `x.meta`/`json`, while missing-sidecar
@@ -337,11 +327,14 @@ network call.
    - timestamps and optional character/chat ownership under `inlay_meta/<id>`.
 
 4. On `/api/write`, the Node server decodes the serialized `inlay/<id>` payload. Its
-   physical publication stages and fsyncs `save/inlays/<id>.<ext>` plus
-   `<id>.meta.json`, renames the payload, then renames the sidecar. For an extension
-   change the sidecar rename is the reader-visible commit point; the previous payload is
-   removed only afterward. A pre-commit failure rolls back a newly published
-   different-extension payload and leaves the old sidecar-selected source readable.
+   physical publication stages and fsyncs canonical payload and sidecar paths below the
+   versioned `save/inlays/.inlay-objects-v1/` namespace, renames the payload, then renames
+   the sidecar. Root-level `<id>.<ext>` and `<id>.meta.json` files are legacy
+   compatibility inputs canonicalized at startup, not current write targets. For an
+   extension change the sidecar rename is the reader-visible commit point; the previous
+   payload is removed only afterward. A pre-commit failure rolls back a newly published
+   different-extension payload and leaves the old sidecar-selected source readable. See
+   [Server backend](server-backend.md) for the physical tree.
 5. The physical sidecar contains extension, name, type, and dimensions. Logical
    `inlay_info/<id>` reads/writes map to it with a legacy KV fallback. The separate
    `inlay_meta/<id>` SQLite KV row contains timestamps and optional character/chat
@@ -418,7 +411,9 @@ network call.
 - Server image compression and thumbnails depend on `wasm-vips`.
 - Uploaded notification sounds use the ordinary `assets/<hash>.<ext>` path created by `saveAsset()` (`src/ts/globalApi.svelte.ts:203`).
 - Ordinary assets are garbage-collected by the Node server, not the browser. The collector scans the live database and active optimized plugin rows, marks an unreferenced candidate durably, and deletes it only on a later sweep after the configured grace interval.
-- `scripts/dedup-assets.sh` delegates to the controlled Node dedup worker. Blank operands, existing non-directories, existing non-`assets` targets, and a symlinked asset-directory leaf are rejected before mutation; a missing path is ignored only when its lexical basename is `assets` for unmatched-glob compatibility. Ancestor symlinks canonicalize to the same identity used by runtime and import recovery. The worker acquires every stable save-level asset-maintenance lock in locale-independent UTF-8 byte order, then preflights one UID/GID across every target and candidate, one permission/special-bit mode across directories, and one across regular-file candidates; candidate ownership must also match its target directory. Mixed or unavailable metadata fails before temp recovery or publication. It excludes hidden runtime/tool names, recovers interrupted dedup temps, and publishes byte-equal hardlinks only through link-to-temp, final inode/content/metadata revalidation, atomic rename, and directory fsync. Live ordinary/spooled admission, collision validation, marker changes, and temp-file publication share one ownership scope and therefore detach safely from shared inodes.
+- Filesystem asset publication creates private `0600` temporary files and atomically
+  renames them into place.
+- `scripts/dedup-assets.sh` delegates to the controlled Node dedup worker. Blank operands, existing non-directories, existing non-`assets` targets, and a symlinked asset-directory leaf are rejected before mutation; a missing path is ignored only when its lexical basename is `assets` for unmatched-glob compatibility. Ancestor symlinks canonicalize to the same identity used by runtime and import recovery. The worker acquires every stable save-level asset-maintenance lock in locale-independent UTF-8 byte order, then preflights one UID/GID across every target and candidate, one permission/special-bit mode across directories, and one across regular-file candidates; candidate ownership must also match its target directory. Candidate ownership and permission/special-bit mode are revalidated with inode and content identity before linking and again at the publication boundary. Mixed or unavailable metadata fails before temp recovery or publication. It excludes hidden runtime/tool names, recovers interrupted dedup temps, and publishes byte-equal hardlinks only through link-to-temp, final inode/content/metadata revalidation, atomic rename, and directory fsync. Live ordinary/spooled admission, collision validation, marker changes, and temp-file publication share one ownership scope and therefore detach safely from shared inodes.
 - The Hono alternative does not implement these storage routes; it currently only exposes a CSRF-protected hello route (`server/hono/src/app/index.ts:4`, `server/hono/src/app/index.ts:8`).
 
 ## 5. Conventions & gotchas

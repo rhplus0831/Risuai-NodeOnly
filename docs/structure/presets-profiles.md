@@ -1,7 +1,7 @@
 # Presets and profiles
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-09 against `e2f6d2ea`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -22,6 +22,8 @@ The subsystem also manages official registry sync, imported custom-profile fragm
 | `src/ts/storage/defaultPrompts.ts` | Re-exports `prebuiltPresets.OAI.mainPrompt` and `.jailbreak` as the defaults (`defaultPrompts.ts:3`), preserves exact old prompt strings for migration (`defaultPrompts.ts:5`), and defines the default response-suggestion prompt (`defaultPrompts.ts:7`). |
 | `src/ts/preset/dbDefaults.ts` | Model-preset database normalization. `createEmptyRegistryCache()` returns schema version 4 (`dbDefaults.ts:16`). `applyModelPresetDefaults()` initializes preset/key/cache collections and visibility defaults, sanitizes malformed stored snapshots, and heals resolvable degenerate snapshots (`dbDefaults.ts:174`). Snapshot sanitization is at `dbDefaults.ts:32`; healing is at `dbDefaults.ts:95`. |
 | `src/ts/preset/apiKeyPool.ts` | CRUD over `db.apiKeyPool`. `listApiKeys()` filters by provider and sorts by last update (`apiKeyPool.ts:17`); `getApiKey()` resolves an ID (`apiKeyPool.ts:24`); add/update/remove are at `apiKeyPool.ts:29`, `apiKeyPool.ts:44`, and `apiKeyPool.ts:55`. Every mutation replaces the pool object to trigger Svelte 5 reactivity. |
+| `shared/character-defaults-policy.json` | Shared browser/server contract for nullish character defaults and missing character, persona, and prompt-preset ID assignments. `src/ts/storage/characterDefaults.ts` and `server/node/chat/characterDefaults.cjs` implement the same policy. |
+| `server/node/chat/chatRows.cjs` | Applies the shared character-default contract before stripping and re-encoding both buffered `ingestFullDatabase()` and streamed `ingestStreamingDatabase()` input. |
 
 ### Registry and profile lifecycle
 
@@ -134,7 +136,7 @@ Replacing a preset with an unrelated profile uses the same migration policy at `
 
 `profileUpdate.ts` implements a parallel, richer version-based path: it computes detailed diffs and preserves removed/type-changed values in `orphanValues`. No production component currently imports it, so changing only that module will not change the live update button.
 
-### Database load and repair
+### Database load, ingest, and repair
 
 `setDatabase()` calls `applyModelPresetDefaults()` before installing state (`database.svelte.ts:796`).
 
@@ -147,7 +149,25 @@ That normalization:
 - re-resolves broken snapshots against the persisted official cache and then the bundled registry (`dbDefaults.ts:95`);
 - migrates compatible user values and moves lost values into `orphanValues` (`dbDefaults.ts:130`).
 
-This load-boundary mutation is intentional and persists on the next database save.
+This browser load-boundary mutation is intentional and persists through the normal boot
+save. Browser compatibility normalization is split across that load and the later
+`checkNewFormat()` pass: `setDatabase()` also assigns missing stable prompt-preset IDs,
+while `checkNewFormat()` fills character defaults and assigns missing persona IDs; the
+later `assignIds()` pass enforces missing character IDs. These character/default-ID rules
+come from `shared/character-defaults-policy.json`.
+
+The server independently applies the same shared character/default-ID contract at the
+chat-row ingest boundary. `server/node/chat/chatRows.cjs` normalizes before stripping and
+re-encoding in both non-streaming and streamed ingestion, so imported or defensively
+externalized database rows persist those defaults without depending on a later browser
+save.
+
+For an existing database that predates this contract, `migrateCharacterDefaultsIfNeeded()`
+in `server/node/server.cjs` performs a one-time rewrite with a safety backup and marker.
+Before applying defaults and re-encoding, it snapshots strict optimized plugin-storage
+fields from the raw decoded object and reattaches them to the normalized database so the
+migration cannot drop `pluginCustomStorage` or `pluginStorageMeta`. Publication semantics
+for those fields remain canonical in [Plugin storage](plugin-storage.md).
 
 ### Prompt-preset flow
 

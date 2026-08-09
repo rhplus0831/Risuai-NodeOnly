@@ -1,7 +1,7 @@
 # Chat pipeline
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-09 against `e2f6d2ea`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -246,6 +246,8 @@ sendChat()
 ```
 
 The call occurs at `src/ts/process/index.svelte.ts:1489`; `requestChatData()` is defined at `src/ts/process/request/request.ts:136`. It returns `success`, `fail`, `streaming`, or `multiline` through the `requestDataResponse` union.
+
+Transport selection after this boundary is documented in [Model providers](model-providers.md). Its `/proxy2` fallback is implemented by `registerProxyRoutes()` in `server/node/runtime/proxy.cjs` and registered from `server/node/server.cjs`.
 
 Inside the request subsystem, but before provider dispatch:
 

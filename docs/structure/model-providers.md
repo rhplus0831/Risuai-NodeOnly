@@ -1,7 +1,7 @@
 # Model providers
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-09 against `e2f6d2ea`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -105,12 +105,16 @@ In the legacy regime, `LLMModel.format` selects the wire protocol while `provide
   - `pumpPresetStream()` accumulates adapter deltas and emits throttled cumulative snapshots at `src/ts/process/request/presetStreamPump.ts:109`.
 
 - `src/ts/process/request/jobFetch.ts` — fetch-compatible durable ModelPreset transport.
-  - `makeJobFetch()` creates `/api/model-jobs`, exposes journal replay/live tail as a provider-like `Response`, reattaches interrupted tails, confirms terminal status, and claims completed jobs.
+  - `makeJobFetch()` creates `/api/model-jobs`, exposes journal replay/live tail as a provider-like `Response`, reattaches interrupted tails, confirms terminal status, and delegates hooked main-request `done`/`failed` outcomes through `onTerminalJob`; auxiliary or otherwise unhooked terminal jobs retain transport-owned claims.
   - `ModelJobBusyError` prevents a server `409` from falling back into a duplicate direct request.
+
+- `src/ts/process/request/liveModelJobFinalization.ts` and `src/ts/process/request/liveModelJobSend.ts` — live main-job ownership and durable finalization.
+  - `LiveModelJobSendOwner` collects terminal jobs across a send and its recursive continuations, while `LiveModelJobFinalization.finalizeAfterCommittedSave()` claims them only after the final published chat state crosses a forced save with `outcome.status === 'committed'`.
+  - Thrown/aborted/unpublished sends and rejected or non-committed saves release live ownership but retain the job for normal recovery.
 
 - `src/ts/process/request/jobRecovery.ts` — boot/return recovery for durable jobs and interrupted sends.
   - `decodeStreamingJournalDetailed()` and `decodeJsonJournalDetailed()` reuse the live adapter parsers.
-  - `recoverTerminalJob()` idempotently fills or inserts by generation ID, persists the chat row, logs usage, then claims the job.
+  - `recoverTerminalJob()` holds exact per-chat generation ownership across asynchronous recovery, re-resolves generation identity after journal replay, and persists any required chat mutation before usage logging or claim. A failed save leaves the job unclaimed; server-failed jobs do not synthesize a usage log.
   - `attachRunningJob()` installs a background per-chat guard and polls the server to terminal state.
   - `recoverModelJobs()` discovers work; `initModelJobRecovery()` runs it at boot, on visibility return, and when the browser comes online.
 
@@ -173,7 +177,7 @@ In the legacy regime, `LLMModel.format` selects the wire protocol while `provide
 
 - `src/ts/network/proxyJobWs.ts` — Defines and parses WebSocket proxy-job events, decodes base64 chunks, and normalizes timeout errors (`src/ts/network/proxyJobWs.ts:1`, `src/ts/network/proxyJobWs.ts:9`, `src/ts/network/proxyJobWs.ts:21`).
 
-- Colocated tests cover binding/message interchange, cumulative stream pumping, Anthropic cache boundaries, durable job fallback/reattachment/recovery, request logging, local-host classification, and WebSocket proxy-event decoding. The server recorder is covered by `server/node/model-jobs.test.ts`.
+- Colocated tests cover binding/message interchange, cumulative stream pumping, Anthropic cache boundaries, durable job fallback/reattachment/recovery, request logging, local-host classification, and WebSocket proxy-event decoding. The server recorder is covered by `server/node/runtime/model-jobs.test.ts`.
 
 ## 3. Architecture & data flow
 
@@ -325,7 +329,7 @@ Prefix changes delete the local and remote entry; three consecutive prefix misma
 2. The Express server performs the provider request, appends the raw bytes to a journal, and continues consuming upstream after the browser disconnects. It stores only non-sensitive metadata in `save/model-jobs.db`; provider headers and bodies remain memory-only.
 3. The client reads `/api/model-jobs/:id/stream`, which replays from byte zero and then live-tails the same journal. The adapter therefore receives a normal provider-like `Response` for both streaming and JSON calls; the server never parses the provider format.
 4. A broken tail reattaches with exponential backoff. Each new stream replays from zero, so `makeJobFetch()` skips already-delivered bytes. It gives up after five attempts per cycle or three cycles with no progress.
-5. EOF is accepted only after `/api/model-jobs/:id` reports `done`. Completed and live-observed failed jobs are claimed; abort deletes the job and stops the upstream request.
+5. EOF is accepted only after `/api/model-jobs/:id` reports `done`. Main-request `done` and live-observed `failed` outcomes enter the same terminal-finalization path and are claimed only after the final live chat state durably commits; a non-committed save leaves them unclaimed for recovery. Auxiliary or otherwise unhooked terminal jobs may still claim directly. Abort deletes the job and stops the upstream request.
 
 Only main jobs participate in the server's one-running-job-per-chat guard and recovery lists. Auxiliary jobs use the reconnectable transport while their browser pipeline is alive but are never decoded into chat messages. Tool loops remain browser-bound because replaying a side-effecting tool turn would be unsafe; previews also bypass jobs. Network failure or a non-409 job-creation rejection falls back to `makeProxiedFetch()`, supporting older servers. A `409` surfaces as `ModelJobBusyError`, and after a job exists no direct fallback is allowed because it would duplicate generation.
 
@@ -336,7 +340,7 @@ server side in [server backend](server-backend.md#durable-model-requests-and-rec
 
 #### Recovery after browser loss
 
-`initModelJobRecovery()` runs discovery at boot, when the page becomes visible, and on `online`. Unclaimed terminal main jobs are decoded with the same OpenAI-compatible, Anthropic, or Gemini JSON/SSE parsers used by live adapters. Recovery matches `generationInfo.generationId` or message `chatId`, fills a shorter partial message or inserts a new one, explicitly saves the chat row, records provider usage, and only then claims the job. This ordering makes retries idempotent and avoids losing a response when persistence fails.
+`initModelJobRecovery()` runs discovery at boot, when the page becomes visible, and on `online`. Each terminal pass holds exact `Chat.id`-keyed generation ownership; a live or unrelated background owner defers it, and recovery re-locates the chat and re-resolves `generationInfo.generationId` or message `chatId` after journal replay. Completed-job recovery fills a shorter partial message or inserts a new one, explicitly saves any required chat state, records a recovery request log with any parsed provider usage, and only then claims the job. Server-failed recovery similarly saves any inserted error state before claim but does not record usage. A failed save leaves the job unclaimed, making retries idempotent without losing a response.
 
 A still-running main job creates a `background` entry in the per-chat generation map and is polled with a 3-to-15-second backoff, up to a 65-minute deadline. It blocks a duplicate send for that chat without setting the legacy global `doingChat`; Stop deletes the server job. Recovery saves raw adapter-decoded text and deliberately does not replay live-pipeline scripts, triggers, TTS, translation, inlay handling, or auto-continue.
 
@@ -362,6 +366,8 @@ Classic requests and ModelPreset requests that bypass durable jobs use two trans
 
 - JSON-style `globalFetch()` chooses direct browser fetch only for local known hosts, `db.usePlainFetch`, or `plainFetchForce`; otherwise it uses a userscript fetch when available or `/proxy2` (`src/ts/globalApi.svelte.ts:1248-1256`).
 - Stream-capable `fetchNative()` attempts direct fetch, then falls back to `/proxy2` on a CORS/network exception (`src/ts/globalApi.svelte.ts:1992`, `:2094`).
+
+The `/proxy2` route family is implemented by `registerProxyRoutes()` in `server/node/runtime/proxy.cjs` and registered from `server/node/server.cjs`.
 
 Explicit local-network routing changes the behavior:
 

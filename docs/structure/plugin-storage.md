@@ -1,7 +1,7 @@
 # Plugin storage
 
 > Part of the [PocketRisu structure guide](../../STRUCTURE.md). Audited on
-> 2026-08-04 against `95c2ea30`. Prefer the symbols below over volatile line numbers.
+> 2026-08-09 against `e2f6d2ea`. Prefer the symbols below over volatile line numbers.
 
 ## Purpose and scope
 
@@ -428,12 +428,15 @@ dedicated authenticated routes:
   the exact external row, and streams it with its SHA-256. `NodeStorage` independently
   hashes the received bytes before exposing the download.
 - `POST /api/plugin-storage/recovery/resolve` is active-session fenced and accepts one
-  explicit `use-inline` or `delete` action. A stale proof returns a definitive 409 without
-  mutation. Inline recovery atomically replaces the row and adopts it into the selected
-  manifest when needed; deletion is offered only without a usable inline copy and removes
-  a value's owner sidecar plus manifest membership in the same quota-accounted SQLite
-  transaction. Both actions retain the inline database copy until ordinary boot
-  reconciliation proves the repaired publication and clears it.
+  explicit `use-inline` or `delete` action. It captures the admitted writer session and
+  writer epoch before entering the storage queue and rechecks that same pair after queued
+  inspection, so a resolve waiting for a superseded writer returns 423 without mutation.
+  A stale proof returns a definitive 409 without mutation. Inline recovery atomically
+  replaces the row and adopts it into the selected manifest when needed; deletion is
+  offered only without a usable inline copy and removes a value's owner sidecar plus
+  manifest membership in the same quota-accounted SQLite transaction. Both actions retain
+  the inline database copy until ordinary boot reconciliation proves the repaired
+  publication and clears it.
 
 Inspection and mutation responses never contain decoded keys, plugin values, or caught
 exception text. Manifest corruption, list/read failures, and other states without a safe
@@ -448,6 +451,10 @@ revision-bound so a concurrent change surfaces as a conflict. Local Storage
 (`safe_plugin_*` strings) and IndexedDB (`SafeLocalPluginStorage` JSON) are device-local
 and have no server publication token. All three retain at most 50 value bodies per page;
 value search intentionally scans only the resident page.
+
+Viewer entries keep a faithful typed editor source separate from the lossy display text.
+Strict-JSON strings therefore remain strings, lossless-codec values are read-only, and
+saving an unchanged editor is a no-op that leaves the stored value bytes identical.
 
 Optimized display sizes live in `plugin_storage_viewer_value_facets`; normalized owners
 remain in `plugin_storage_owners`. Both are operational, rebuildable metadata rather than
@@ -513,15 +520,15 @@ Representative suites include:
 - `src/ts/plugins/apiV3/pluginStorageGeneration.test.ts`
 - `src/ts/plugins/apiV3/pluginStorageUpdate.test.ts`
 - `src/ts/storage/pluginStorageBatch.test.ts`
-- `server/node/pluginSaveKeys.test.ts`
-- `server/node/pluginStorageJson.test.ts`
+- `server/node/plugin-storage/pluginSaveKeys.test.ts`
+- `server/node/plugin-storage/pluginStorageJson.test.ts`
 - `test/compat/plugin-storage-mutation-atomicity.test.ts`
 - `test/compat/plugin-storage-batch-atomicity.test.ts`
 - `test/compat/plugin-storage-bulk-transition.test.ts`
 - `test/compat/plugin-storage-boot-reconcile.test.ts`
 - `test/compat/plugin-storage-staged-transition-boundaries.test.ts`
 - `test/compat/plugin-storage-viewer-page.test.ts`
-- `server/node/snapshotPluginStorage.e2e.test.ts`
+- `server/node/plugin-storage/snapshotPluginStorage.e2e.test.ts`
 
 Run the client, server, and compat suites; no one command aggregates them.
 
