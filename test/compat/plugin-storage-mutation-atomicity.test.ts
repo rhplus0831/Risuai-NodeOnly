@@ -330,11 +330,11 @@ async function mutateWithClientOutcome(
 describe('atomic optimized plugin value and owner acknowledgement', () => {
   test('the streamed single-row route validates the spool without materializing it', () => {
     const source = readFileSync(
-      new URL('../../server/node/server.cjs', import.meta.url),
+      new URL('../../server/node/plugin-storage/pluginStorageRoutes.cjs', import.meta.url),
       'utf-8',
     )
     const routeStart = source.indexOf("app.post('/api/plugin-storage/mutate'")
-    const routeEnd = source.indexOf('// ─── /api/logs', routeStart)
+    const routeEnd = source.indexOf('function registerPluginStorageTransitionRoutes(app)', routeStart)
     expect(routeStart).toBeGreaterThanOrEqual(0)
     expect(routeEnd).toBeGreaterThan(routeStart)
 

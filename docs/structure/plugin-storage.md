@@ -146,9 +146,12 @@ Express + SQLite
   limits. Defaults are 128 MiB per value and 1 GiB total optimized storage.
 - `server/node/db/db.cjs` owns atomic quota/owner accounting and the derived
   `plugin_storage_usage` and `plugin_storage_owners` tables.
-- `server/node/server.cjs` owns manifest, mutation, viewer, transition, capacity, and
-  recovery routes, including proof-bound affected-row inspection/download/resolution;
-  generic KV routes guard the reserved namespace.
+- `server/node/plugin-storage/pluginStorageRoutes.cjs` owns the manifest, mutation,
+  viewer, transition, and recovery routes, including proof-bound affected-row
+  inspection/download/resolution. `server/node/server.cjs` retains the publication
+  engine (manifest read/write, generation, publication readers, session read-state,
+  spool/stage lifecycle) that those routes and the generic KV paths share; generic KV
+  routes guard the reserved namespace.
 - `shared/plugin-save-key-policy.json` is the shared archive/key-name contract.
 - `src/lib/Setting/Pages/PluginSettings.svelte` owns compatibility, conversion,
   optimization transition, restore-first recovery guidance, and the affected-data

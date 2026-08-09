@@ -322,13 +322,11 @@ function readGeneration(cwd: string): 'old' | 'new' | 'torn' {
 describe('AA3 atomic plugin storage batch', () => {
   test('the committed batch path performs no post-commit row or manifest rereads', () => {
     const source = readFileSync(
-      new URL('../../server/node/server.cjs', import.meta.url),
+      new URL('../../server/node/plugin-storage/pluginStorageRoutes.cjs', import.meta.url),
       'utf-8',
     )
     const routeStart = source.indexOf("app.post('/api/plugin-storage/batch'")
-    // End marker: the storage list-sizes registration call that directly follows
-    // the batch route (the former inline route moved to runtime/observability.cjs).
-    const routeEnd = source.indexOf('registerStorageListSizesRoute(app', routeStart)
+    const routeEnd = source.indexOf('function sendPluginStorageMutationLimitError', routeStart)
     expect(routeStart).toBeGreaterThanOrEqual(0)
     expect(routeEnd).toBeGreaterThan(routeStart)
     const route = source.slice(routeStart, routeEnd)
