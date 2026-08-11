@@ -206,6 +206,31 @@ describe('persistent spool ownership', () => {
     expect(mode(owned)).toBe(0o700)
   })
 
+  test('Windows skips POSIX mode hardening for existing identity files', () => {
+    const savePath = tempSave()
+    const ownerPath = path.join(savePath, SPOOL_OWNER_ID_FILENAME)
+    const owner = '8e2f058c-c60e-4cf5-9c8f-c610dad93ac0'
+    fs.writeFileSync(ownerPath, owner, { mode: 0o666 })
+    fs.chmodSync(ownerPath, 0o666)
+    const fsOps = Object.create(fs) as typeof fs
+    fsOps.fchmodSync = (() => {
+      throw new Error('Windows identity reads must not enforce POSIX modes')
+    }) as typeof fs.fchmodSync
+    fsOps.fsyncSync = (() => {
+      throw new Error('Windows identity reads must not fsync a read-only handle')
+    }) as typeof fs.fsyncSync
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    try {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+      expect(readOrCreatePersistentUuid(ownerPath, { fs: fsOps })).toBe(owner)
+    } finally {
+      if (platform) Object.defineProperty(process, 'platform', platform)
+    }
+
+    expect(mode(ownerPath)).toBe(0o666)
+  })
+
   test('an owned-child symlink is repaired without sweeping its outside victim', () => {
     const savePath = tempSave()
     const root = path.join(savePath, 'spool')

@@ -53,7 +53,12 @@ function openRegularFileNoFollow(filePath, fsOps = fs, { harden = false } = {}) 
             closeDescriptor(descriptor, fsOps);
             return null;
         }
-        if (harden && (after.mode & 0o777) !== 0o600) {
+        // Windows does not preserve POSIX owner/group/other mode bits. Trying
+        // to normalize a readable identity file to exactly 0600 therefore
+        // repeats on every boot, and fsync on this read-only handle can fail
+        // with EPERM. Keep the no-follow/type/identity checks on Windows, but
+        // leave access control to the filesystem ACLs.
+        if (harden && process.platform !== 'win32' && (after.mode & 0o777) !== 0o600) {
             fsOps.fchmodSync(descriptor, 0o600);
             fsOps.fsyncSync(descriptor);
         }
