@@ -38,6 +38,9 @@ function recoveryPathKeepSetHas(keep, entry, platform = process.platform) {
     return false;
 }
 
+// This module is copied by the dependency-free source and Windows updaters,
+// so keep this small platform boundary local rather than adding runtime-module
+// resolution to the recovery-lock finalizer.
 function directoryFsyncErrorIsUnsupported(error, platform = process.platform) {
     if (error?.code === 'EINVAL' || error?.code === 'ENOTSUP') return true;
     return platform === 'win32'

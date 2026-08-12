@@ -5,6 +5,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const zlib = require('zlib');
 const { Readable } = require('stream');
+const { sameFileIdentity } = require('../runtime/platformFilesystem.cjs');
 
 const IMPORT_IO_PAGE_BYTES = 64 * 1024;
 const SAVE_FOLDER_IMPORT_STAGE_PREFIX = '.save-folder-import-';
@@ -215,15 +216,40 @@ async function spoolAsyncIterable(source, filePath, {
     }
 }
 
-async function copyFileToSpool(sourcePath, destinationPath, options = {}) {
+async function openStableRegularFile(filePath, options = {}) {
+    const before = options.expectedStat ?? await fs.lstat(filePath);
+    if (!before.isFile() || before.isSymbolicLink()) {
+        throw importFormatError('Import source must be a regular file', 'INVALID_IMPORT_SOURCE');
+    }
     const noFollow = fsSync.constants.O_NOFOLLOW ?? 0;
-    const sourceHandle = await fs.open(sourcePath, fsSync.constants.O_RDONLY | noFollow);
+    const handle = await fs.open(filePath, fsSync.constants.O_RDONLY | noFollow);
+    try {
+        const after = await handle.stat();
+        if (!after.isFile()
+            || !sameFileIdentity(before, after)
+            || before.size !== after.size
+            || before.mtimeMs !== after.mtimeMs
+            || before.ctimeMs !== after.ctimeMs) {
+            throw importFormatError(
+                'Import source changed after preflight',
+                'IMPORT_SOURCE_CHANGED',
+            );
+        }
+        return { before, handle, stat: after };
+    } catch (error) {
+        await handle.close().catch(() => {});
+        throw error;
+    }
+}
+
+async function copyFileToSpool(sourcePath, destinationPath, options = {}) {
+    const opened = await openStableRegularFile(sourcePath, {
+        expectedStat: options.expectedStat,
+    });
+    const sourceHandle = opened.handle;
     let stream;
     try {
-        const stat = await sourceHandle.stat();
-        if (!stat.isFile()) {
-            throw importFormatError('Save-folder entries must be regular files', 'INVALID_SAVE_FOLDER_ENTRY');
-        }
+        const stat = opened.stat;
         assertImportSize(stat.size, options.maxBytes, 'Save-folder entry');
         // Read through the already-open descriptor. A path replacement after
         // preflight cannot redirect the staged import to a symlink or new file.
@@ -231,10 +257,23 @@ async function copyFileToSpool(sourcePath, destinationPath, options = {}) {
             autoClose: false,
             highWaterMark: IMPORT_IO_PAGE_BYTES,
         });
-        return await spoolAsyncIterable(stream, destinationPath, {
+        const staged = await spoolAsyncIterable(stream, destinationPath, {
             ...options,
             expectedBytes: stat.size,
         });
+        const finalStat = await sourceHandle.stat();
+        if (stat.size !== finalStat.size
+            || stat.mtimeMs !== finalStat.mtimeMs
+            || stat.ctimeMs !== finalStat.ctimeMs) {
+            throw importFormatError(
+                'Import source changed while being spooled',
+                'IMPORT_SOURCE_CHANGED',
+            );
+        }
+        return staged;
+    } catch (error) {
+        await fs.unlink(destinationPath).catch(() => {});
+        throw error;
     } finally {
         stream?.destroy();
         await sourceHandle.close().catch(() => {});
@@ -740,7 +779,8 @@ async function inspectZipFile(zipPath, {
     if (!Number.isSafeInteger(maxExpandedBytes) || maxExpandedBytes <= 0) {
         throw new TypeError('A finite positive ZIP expansion limit is required');
     }
-    const fileHandle = await fs.open(zipPath, 'r');
+    const opened = await openStableRegularFile(zipPath);
+    const fileHandle = opened.handle;
     try {
         const { size } = await fileHandle.stat();
         const { position: endPosition, record } = await findZipEndRecord(fileHandle, size, {
@@ -852,7 +892,14 @@ async function inspectZipFile(zipPath, {
         if (cursor !== centralOffset + centralSize) {
             throw importFormatError('ZIP central directory size does not match its entries', 'INVALID_SAVE_FOLDER_ZIP');
         }
-        return { zipPath, size, entries, entryCount, expandedBytes };
+        return {
+            zipPath,
+            sourceStat: opened.stat,
+            size,
+            entries,
+            entryCount,
+            expandedBytes,
+        };
     } finally {
         await fileHandle.close();
     }
@@ -862,9 +909,19 @@ async function extractZipEntry(zipPath, entry, destinationPath, {
     signal,
     shouldAbort,
     onPage,
+    sourceStat,
 } = {}) {
-    const handle = await fs.open(zipPath, 'r');
+    const opened = await openStableRegularFile(zipPath, { expectedStat: sourceStat });
+    const handle = opened.handle;
     let local;
+    let output;
+    let input;
+    let decoded;
+    let inflater;
+    let actualSize = 0;
+    let pages = 0;
+    let maxPageBytes = 0;
+    let crc = 0xffffffff;
     try {
         local = await readExact(handle, entry.localHeaderOffset, 30, { signal, shouldAbort });
         if (local.readUInt32LE(0) !== ZIP_LOCAL_SIGNATURE
@@ -898,21 +955,10 @@ async function extractZipEntry(zipPath, entry, destinationPath, {
             || entry.dataOffset + entry.compressedSize > entry.dataLimit) {
             throw importFormatError('ZIP entry data bounds are invalid', 'INVALID_SAVE_FOLDER_ZIP');
         }
-    } finally {
-        await handle.close();
-    }
-
-    const output = await fs.open(destinationPath, 'wx', 0o600);
-    let input;
-    let decoded;
-    let inflater;
-    let actualSize = 0;
-    let pages = 0;
-    let maxPageBytes = 0;
-    let crc = 0xffffffff;
-    try {
+        output = await fs.open(destinationPath, 'wx', 0o600);
         if (entry.compressedSize > 0) {
-            input = fsSync.createReadStream(zipPath, {
+            input = handle.createReadStream({
+                autoClose: false,
                 start: entry.dataOffset,
                 end: entry.dataOffset + entry.compressedSize - 1,
                 highWaterMark: IMPORT_IO_PAGE_BYTES,
@@ -965,6 +1011,7 @@ async function extractZipEntry(zipPath, entry, destinationPath, {
         }
         await output.sync();
         await output.close();
+        output = null;
         return {
             key: entry.key,
             filePath: destinationPath,
@@ -975,12 +1022,16 @@ async function extractZipEntry(zipPath, entry, destinationPath, {
     } catch (error) {
         input?.destroy();
         if (decoded && decoded !== input) decoded.destroy();
-        try { await output.close(); } catch {}
+        try { await output?.close(); } catch {}
         await fs.unlink(destinationPath).catch(() => {});
         if (typeof error?.code === 'string' && error.code.startsWith('Z_')) {
             throw importFormatError('ZIP compressed stream is invalid', 'CORRUPT_SAVE_FOLDER_ENTRY');
         }
         throw error;
+    } finally {
+        input?.destroy();
+        if (decoded && decoded !== input) decoded.destroy();
+        await handle.close().catch(() => {});
     }
 }
 
@@ -995,7 +1046,7 @@ async function extractZipEntries(inventory, stageDir, options = {}) {
                 inventory.zipPath,
                 inventory.entries[index],
                 destination,
-                options,
+                { ...options, sourceStat: inventory.sourceStat },
             ));
         }
         return sources;

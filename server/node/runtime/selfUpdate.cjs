@@ -7,7 +7,7 @@ const {
     writeFileSync,
 } = require('fs');
 const fs = require('fs/promises');
-const { spawn, execSync } = require('child_process');
+const { spawn } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
 const { pipeline } = require('stream/promises');
@@ -18,6 +18,7 @@ const {
     publishRecoveryPathStateLockHandoffSync,
     recoveryPathKeepSetHas,
 } = require('../recoveryPathMarkers.cjs');
+const { extractArchiveSync } = require('./archiveExtraction.cjs');
 
 let selfUpdateInProgress = false;
 let recoveryPathStateLockTail = Promise.resolve();
@@ -31,6 +32,10 @@ function withLocalRecoveryPathStateLock(operation) {
 
 function isSelfUpdateInProgress() {
     return selfUpdateInProgress;
+}
+
+function quoteWindowsBatchArgument(value) {
+    return `"${String(value).replaceAll('%', '%%')}"`;
 }
 
 async function waitAtRecoveryPathStateTestGate(stage) {
@@ -312,19 +317,9 @@ function registerSelfUpdateRoutes(app, ctx) {
             const extractDir = path.join(tmpDir, 'extracted');
             await fs.mkdir(extractDir, { recursive: true });
 
-            if (process.platform === 'win32') {
-                try {
-                    // Windows 10 1803+ has tar.exe built-in, handles zip, much faster than PowerShell
-                    execSync(`tar -xf "${archivePath}" -C "${extractDir}"`, { timeout: 300000 });
-                } catch {
-                    execSync(
-                        `powershell -NoProfile -Command "Expand-Archive -Force -Path '${archivePath}' -DestinationPath '${extractDir}'"`,
-                        { timeout: 300000 },
-                    );
-                }
-            } else {
-                execSync(`tar -xzf "${archivePath}" -C "${extractDir}"`, { timeout: 300000 });
-            }
+            extractArchiveSync(archivePath, extractDir, {
+                format: assetInfo.ext === 'zip' ? 'zip' : 'tar.gz',
+            });
 
             // Resolve possibly nested root directory (same as updater.cjs resolveExtractedRoot)
             const entries = await fs.readdir(extractDir);
@@ -548,37 +543,40 @@ function registerSelfUpdateRoutes(app, ctx) {
                         '@echo off',
                         'timeout /t 3 /nobreak >nul',
                         // Apply staged bin/: backup current → copy new → on failure restore backup
-                        `if exist "${path.join(utmp, 'new-bin')}\\" (`,
-                        `  if exist "${binDir}\\" (`,
-                        `    xcopy /E /I /Y "${binDir}\\*" "${binBackup}\\" >nul`,
+                        `if exist ${quoteWindowsBatchArgument(`${path.join(utmp, 'new-bin')}\\`)} (`,
+                        `  if exist ${quoteWindowsBatchArgument(`${binDir}\\`)} (`,
+                        `    xcopy /E /I /Y ${quoteWindowsBatchArgument(`${binDir}\\*`)} ${quoteWindowsBatchArgument(`${binBackup}\\`)} >nul`,
                         `  )`,
-                        `  xcopy /E /I /Y "${path.join(utmp, 'new-bin')}\\*" "${binDir}\\" >nul`,
+                        `  xcopy /E /I /Y ${quoteWindowsBatchArgument(`${path.join(utmp, 'new-bin')}\\*`)} ${quoteWindowsBatchArgument(`${binDir}\\`)} >nul`,
                         `  if errorlevel 1 (`,
                         `    echo [Update] bin/ copy failed, restoring backup...`,
-                        `    if exist "${binBackup}\\" (`,
-                        `      xcopy /E /I /Y "${binBackup}\\*" "${binDir}\\" >nul`,
+                        `    if exist ${quoteWindowsBatchArgument(`${binBackup}\\`)} (`,
+                        `      xcopy /E /I /Y ${quoteWindowsBatchArgument(`${binBackup}\\*`)} ${quoteWindowsBatchArgument(`${binDir}\\`)} >nul`,
                         `    )`,
                         `    echo [Update] bin/ restored. Staged files kept for retry.`,
                         `    goto finalize`,
                         `  )`,
                         `)`,
                         // Finalize version marker only after successful bin/ copy
-                        `if exist "${path.join(utmp, 'latest-version')}" (`,
-                        `  copy /Y "${path.join(utmp, 'latest-version')}" "${path.join(appDir, '.installed-version')}" >nul`,
+                        `if exist ${quoteWindowsBatchArgument(path.join(utmp, 'latest-version'))} (`,
+                        `  copy /Y ${quoteWindowsBatchArgument(path.join(utmp, 'latest-version'))} ${quoteWindowsBatchArgument(path.join(appDir, '.installed-version'))} >nul`,
                         `)`,
                         ':finalize',
-                        `"${path.join(binDir, 'node.exe')}" "${finalizerScript}" "${handoffPath}"`,
+                        `${quoteWindowsBatchArgument(path.join(binDir, 'node.exe'))} ${quoteWindowsBatchArgument(finalizerScript)} ${quoteWindowsBatchArgument(handoffPath)}`,
                         `if errorlevel 1 exit /b 1`,
                         // Cleanup .update-tmp (includes old-bin backup)
-                        `rmdir /s /q "${utmp}" 2>nul`,
+                        `rmdir /s /q ${quoteWindowsBatchArgument(utmp)} 2>nul`,
                         ':start',
                         // Start server with correct working directory
-                        `cd /d "${appDir}"`,
-                        `start "" "${path.join(appDir, 'bin', 'node.exe')}" "${path.join(appDir, 'server', 'node', 'server.cjs')}"`,
+                        `cd /d ${quoteWindowsBatchArgument(appDir)}`,
+                        `start "" ${quoteWindowsBatchArgument(path.join(appDir, 'bin', 'node.exe'))} ${quoteWindowsBatchArgument(path.join(appDir, 'server', 'node', 'server.cjs'))}`,
                         'exit /b 0',
                     ];
                     writeFileSync(batScript, batLines.join('\r\n'));
-                    spawn('cmd.exe', ['/c', batScript], { detached: true, stdio: 'ignore' }).unref();
+                    spawn('cmd.exe', ['/d', '/s', '/c', batScript], {
+                        detached: true,
+                        stdio: 'ignore',
+                    }).unref();
                     recoveryPathInterprocessLockHandedOff = true;
                 } else {
                     // Unix: Node restart helper with port-check to avoid clashing with process managers
@@ -656,4 +654,5 @@ module.exports = {
     withLocalRecoveryPathStateLock,
     waitAtRecoveryPathStateTestGate,
     addUpdaterRecoveryKeeps,
+    quoteWindowsBatchArgument,
 };

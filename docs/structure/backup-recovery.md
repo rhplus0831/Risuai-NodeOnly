@@ -290,9 +290,10 @@ Automatic snapshots assemble a self-contained database recovery row under
 `database/dbbackup-*`. They are triggered by eligible committed mutations and rotated by
 count and exclusive chunk cost.
 
-- Snapshot assembly uses the installation-owned child of the configured shared DB-spool
+- Snapshot assembly uses the installation-owned namespace of the configured shared DB-spool
   root (`POCKETRISU_SPOOL_DIR` or `save/.spool`) and streams the final file through
-  chunk-aware storage. Peer owner namespaces are never swept by this installation.
+  chunk-aware storage. POSIX uses its pinned owned child; Windows uses a fresh per-process
+  `.runtime-*` child and deliberately retains stale children. Peer owner namespaces are never swept.
 - The short queued capture phase flushes any pending debounced database persist, opens
   one read-only WAL snapshot, and records a global source token. The token combines the
   database row/chunk revisions and verified logical size, every chat row mutation token
@@ -598,19 +599,21 @@ Important private roots:
 - `.instance-<sha256(__spool_owner_id)>.claim` below that root: a private durable
   binding between the owner UUID and the canonical save root. A copied save tree at a
   different path must reseed its copied UUID before it can claim or sweep a namespace;
-- `.instance-<sha256(__spool_owner_id)>/` below that root: this installation's admitted
+- `.instance-<sha256(__spool_owner_id)>/` below that root: this installation's owned
   database/chat/KV request bodies and private validation stages, database assembly,
   import-entry/database, plugin-value, and snapshot-restore spools. Startup and runtime
   recovery create/revalidate this real private-mode child without following symlinks.
-  Startup completes the claim before touching the child, atomically quarantines the old
+  On POSIX, startup completes the claim before touching the child, atomically quarantines the old
   child, verifies that the pinned quarantine is the exact pre-rename source, and sweeps
   recognized artifacts only through pinned old/fresh directory identities. Unrelated
   regular files publish create-only into the fresh child while the old links and all
   conflicts remain quarantined. Quarantine pathnames are retained unconditionally after
   descriptor close; runtime writers and readers use the process-lifetime pinned fresh identity,
   never the reusable child pathname.
-  Platforms without a validated descriptor-relative directory alias retain the quarantine
-  instead of risking pathname-redirection during deletion;
+  On Windows, Node does not expose an equivalent validated descriptor-relative directory
+  alias. Runtime creates a private `.runtime-*` child, performs no old-boot recursive sweep,
+  and removes it on clean exit only if identity validation shows it is still empty. Crashes
+  therefore retain stale runtime children rather than risk deleting a replacement pathname;
 - `save/.partial-export-spool/`: private full/partial filesystem pins;
 - `save/.plugin-transition-staging/`: durable plugin mode-transition stages;
 - asset/inlay import staging and rollback directories beside their final stores.
@@ -727,7 +730,9 @@ and database remain continuously present even if the updater is killed. Windows 
 and in-process updates atomically publish a token handoff under `.update-tmp`; the batch
 post-step retains that exact logical ownership through bundled-Node copy and version
 finalization, then the packaged dependency-free finalizer verifies the token and releases
-the lock exactly once. A killed or broken post-step leaves the lock fail-closed.
+the lock exactly once. Update archive extraction uses literal process arguments (with an
+encoded PowerShell fallback for Windows ZIPs), and generated batch paths escape percent
+expansion. A killed or broken post-step leaves the lock fail-closed.
 
 Docker Compose persists `/app/save` and `/app/backups` in separate explicitly named
 volumes. Default chat history under `/app/save/chat-backups` and default server archives

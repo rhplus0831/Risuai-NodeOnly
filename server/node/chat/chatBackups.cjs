@@ -24,6 +24,15 @@ const zlib = require('node:zlib');
 const crypto = require('node:crypto');
 const { pipeline } = require('node:stream/promises');
 const { decodeRisuSave } = require('../utils.cjs');
+const {
+    decodePortablePathComponent,
+    encodeLegacyPathComponent,
+    encodePortablePathComponent,
+} = require('../runtime/portablePath.cjs');
+const {
+    directoryFsyncErrorIsUnsupported,
+    renamePublishedFileSync,
+} = require('../runtime/platformFilesystem.cjs');
 
 const CHAT_BACKUP_DIRNAME = 'chat-backups';
 const CHAT_BACKUP_DIR_ENV = 'POCKETRISU_CHAT_BACKUP_DIR';
@@ -182,14 +191,6 @@ function filesHaveIdenticalBytes(firstPath, secondPath) {
     }
 }
 
-const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set([
-    'EBADF',
-    'EINVAL',
-    'EISDIR',
-    'ENOTSUP',
-    'EPERM',
-]);
-
 function syncDirectoryForMigration(directory) {
     let fd;
     try {
@@ -197,7 +198,7 @@ function syncDirectoryForMigration(directory) {
         fs.fsyncSync(fd);
         return true;
     } catch (error) {
-        if (UNSUPPORTED_DIRECTORY_FSYNC_CODES.has(error?.code)) return false;
+        if (error?.code === 'EBADF' || directoryFsyncErrorIsUnsupported(error)) return false;
         throw error;
     } finally {
         if (fd !== undefined) {
@@ -606,19 +607,11 @@ function isDestructiveBackupReason(reason) {
 }
 
 function encodePathComponent(value) {
-    // encodeURIComponent leaves traversal-only dot components literal.
-    const encoded = encodeURIComponent(String(value));
-    if (encoded === '.') return '%2E';
-    if (encoded === '..') return '%2E%2E';
-    return encoded;
+    return encodePortablePathComponent(value);
 }
 
 function decodePathComponent(value) {
-    try {
-        return decodeURIComponent(value);
-    } catch {
-        return null;
-    }
+    return decodePortablePathComponent(value);
 }
 
 function parseVersionId(versionId) {
@@ -871,6 +864,20 @@ function createChatBackupStore(options) {
         );
     }
 
+    function legacyChatDirectoryAt(root, chaId, chatId) {
+        return path.join(
+            root,
+            encodeLegacyPathComponent(chaId),
+            encodeLegacyPathComponent(chatId),
+        );
+    }
+
+    function chatDirectoryCandidatesAt(root, chaId, chatId) {
+        const current = chatDirectoryAt(root, chaId, chatId);
+        const legacy = legacyChatDirectoryAt(root, chaId, chatId);
+        return current === legacy ? [current] : [current, legacy];
+    }
+
     function chatDirectory(chaId, chatId) {
         return chatDirectoryAt(backupsTreeRoot(), chaId, chatId);
     }
@@ -890,7 +897,7 @@ function createChatBackupStore(options) {
             } finally {
                 if (fileFd !== undefined) fs.closeSync(fileFd);
             }
-            fs.renameSync(temp, destination);
+            renamePublishedFileSync(temp, destination);
 
             let directoryFd;
             try {
@@ -2525,15 +2532,16 @@ function createChatBackupStore(options) {
 
     function resolveChatBackupVersions(chaId, chatId) {
         const candidates = backupsReadRootRecords().flatMap((rootRecord) => {
-            const chatDir = chatDirectoryAt(rootRecord.root, chaId, chatId);
-            return versionsInChatDirectory(chatDir).map(entry => ({
-                ...entry,
-                chatDir,
-                rootIdentity: rootRecord.identity,
-                activeRoot: rootRecord.active,
-                originalEligible: rootRecord.originalEligible,
-                sourceVersionId: entry.versionId,
-            }));
+            return chatDirectoryCandidatesAt(rootRecord.root, chaId, chatId).flatMap(chatDir => (
+                versionsInChatDirectory(chatDir).map(entry => ({
+                    ...entry,
+                    chatDir,
+                    rootIdentity: rootRecord.identity,
+                    activeRoot: rootRecord.active,
+                    originalEligible: rootRecord.originalEligible,
+                    sourceVersionId: entry.versionId,
+                }))
+            ));
         });
         const reservedIds = new Set(candidates.map(entry => entry.sourceVersionId));
         const acceptedBySourceId = new Map();
@@ -2949,4 +2957,6 @@ module.exports = {
     CHAT_BACKUP_MAX_MAX_UNCOMPRESSED_BYTES,
     FRAME_FORMAT,
     COLD_STORAGE_HEADER,
+    decodePathComponent,
+    encodePathComponent,
 };

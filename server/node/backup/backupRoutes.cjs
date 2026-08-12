@@ -3669,6 +3669,7 @@ function createBackupRouteFamily(ctx) {
                 assertImportSize(nextBytes, BACKUP_IMPORT_MAX_BYTES, 'Save folder');
                 const destination = path.join(stageDir, `${String(sources.length).padStart(8, '0')}.row`);
                 const staged = await copyFileToSpool(sourcePath, destination, {
+                    expectedStat: stat,
                     maxBytes: BACKUP_IMPORT_MAX_BYTES,
                     signal,
                 });

@@ -10,6 +10,7 @@ const {
     IMPORT_IO_PAGE_BYTES,
     finiteByteLimit,
     importErrorPayload,
+    copyFileToSpool,
     spoolAsyncIterable,
     readFileToBufferBounded,
     validateJsonFileStreaming,
@@ -19,6 +20,15 @@ const {
     IMPORT_IO_PAGE_BYTES: number
     finiteByteLimit: (raw: unknown, fallback: number) => number
     importErrorPayload: (error: unknown) => Record<string, unknown> | null
+    copyFileToSpool: (
+        sourcePath: string,
+        destinationPath: string,
+        options: {
+            maxBytes: number
+            expectedStat?: fs.Stats
+            onPage?: (page: { index: number; size: number; total: number }) => void
+        },
+    ) => Promise<{ filePath: string, size: number }>
     spoolAsyncIterable: (
         source: AsyncIterable<Uint8Array>,
         filePath: string,
@@ -57,11 +67,13 @@ const {
         entries: unknown[]
         entryCount: number
         expandedBytes: number
+        sourceStat: fs.Stats
     }>
     extractZipEntries: (
         inventory: {
             zipPath: string
             entries: unknown[]
+            sourceStat: fs.Stats
         },
         stageDir: string,
         options?: {
@@ -191,6 +203,44 @@ describe('finite import limits and bounded spooling', () => {
             },
         })).rejects.toMatchObject({ code: 'IMPORT_ABORTED' })
         expect(fs.existsSync(partialPath)).toBe(false)
+    })
+
+    it('rejects a save-folder source replaced after preflight', async () => {
+        const root = makeRoot()
+        const sourcePath = path.join(root, 'source.bin')
+        const parkedPath = path.join(root, 'source.parked.bin')
+        const destinationPath = path.join(root, 'destination.bin')
+        fs.writeFileSync(sourcePath, 'original')
+        const expectedStat = fs.lstatSync(sourcePath)
+        fs.renameSync(sourcePath, parkedPath)
+        fs.writeFileSync(sourcePath, 'replacement')
+
+        await expect(copyFileToSpool(sourcePath, destinationPath, {
+            expectedStat,
+            maxBytes: 1024,
+        })).rejects.toMatchObject({ code: 'IMPORT_SOURCE_CHANGED' })
+        expect(fs.existsSync(destinationPath)).toBe(false)
+    })
+
+    it('rejects an in-place save-folder mutation while copying', async () => {
+        const root = makeRoot()
+        const sourcePath = path.join(root, 'source.bin')
+        const destinationPath = path.join(root, 'destination.bin')
+        const original = bytes(IMPORT_IO_PAGE_BYTES * 2 + 1)
+        fs.writeFileSync(sourcePath, original)
+        let mutated = false
+
+        await expect(copyFileToSpool(sourcePath, destinationPath, {
+            maxBytes: original.length,
+            onPage: () => {
+                if (mutated) return
+                mutated = true
+                fs.writeFileSync(sourcePath, Buffer.alloc(original.length, 0x5a))
+                const future = new Date(Date.now() + 5_000)
+                fs.utimesSync(sourcePath, future, future)
+            },
+        })).rejects.toMatchObject({ code: 'IMPORT_SOURCE_CHANGED' })
+        expect(fs.existsSync(destinationPath)).toBe(false)
     })
 
     it('validates large JSON incrementally and rejects malformed or over-limit rows', async () => {
@@ -352,6 +402,20 @@ describe('file-backed save-folder ZIP inspection and extraction', () => {
         })
     })
 
+    it('rejects a ZIP pathname replaced after inspection', async () => {
+        const root = makeRoot()
+        const zipPath = writeZip(root, { 'database.hex': Buffer.from('original') }, 0)
+        const inventory = await inspect(zipPath)
+        fs.renameSync(zipPath, `${zipPath}.parked`)
+        fs.writeFileSync(zipPath, zipSync({ 'database.hex': Buffer.from('replacement') }))
+        const stage = path.join(root, 'replaced-stage')
+
+        await expect(extractZipEntries(inventory, stage)).rejects.toMatchObject({
+            code: 'IMPORT_SOURCE_CHANGED',
+        })
+        expect(fs.existsSync(stage)).toBe(false)
+    })
+
     it.each([0x0001, 0x0040, 0x2000])(
         'rejects central and local ZIP encryption flag %#x',
         async flag => {
@@ -378,6 +442,7 @@ describe('file-backed save-folder ZIP inspection and extraction', () => {
                 positions.local + 6,
             )
             fs.writeFileSync(cleanPath, localEncrypted)
+            inventory.sourceStat = fs.lstatSync(cleanPath)
             const stage = path.join(root, `encrypted-stage-${flag}`)
             await expect(extractZipEntries(inventory, stage)).rejects.toMatchObject({
                 code: 'ENCRYPTED_SAVE_FOLDER_ENTRY',
@@ -396,6 +461,7 @@ describe('file-backed save-folder ZIP inspection and extraction', () => {
             const { local } = locateSingleZipEntry(zip)
             zip.writeUInt32LE((zip.readUInt32LE(local + fieldOffset) + 1) >>> 0, local + fieldOffset)
             fs.writeFileSync(zipPath, zip)
+            inventory.sourceStat = fs.lstatSync(zipPath)
             const stage = path.join(root, `metadata-stage-${fieldOffset}`)
 
             await expect(extractZipEntries(inventory, stage)).rejects.toMatchObject({

@@ -16,6 +16,7 @@ const {
 } = fsSync;
 const fs = require('fs/promises');
 const nodeCrypto = require('crypto');
+const { hardenPrivateFile } = require('../runtime/platformFilesystem.cjs');
 const { Transform } = require('stream');
 const { pipeline } = require('stream/promises');
 const { addExtension, Unpackr } = require('msgpackr');
@@ -2066,7 +2067,7 @@ function createPluginStorageRouteFamily(ctx) {
                         await fs.unlink(spoolPath).catch(() => {});
                         return null;
                     }
-                    await fs.chmod(spoolPath, 0o600);
+                    await hardenPrivateFile(spoolPath, 0o600, { fs });
                     return {
                         size: row.size,
                         sha256: issue.externalHash,
@@ -3706,7 +3707,7 @@ function createPluginStorageRouteFamily(ctx) {
             if (!result || result.size !== expectedSize) {
                 throw new PluginStorageValidationError(storageKey);
             }
-            await fs.chmod(destinationPath, 0o600);
+            await hardenPrivateFile(destinationPath, 0o600, { fs });
             let displaySize = null;
             if (options.validateJson !== false) {
                 try {

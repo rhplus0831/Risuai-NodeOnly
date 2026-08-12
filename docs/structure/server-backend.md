@@ -45,7 +45,7 @@ composition root and cross-subsystem coverage anchors are listed separately.
 | `server/node/backup/backupRoutes.cjs` | Full/partial export, archive import, server-file and chat-backup reads, save-folder migration, replacement-operation reconciliation, snapshot restore, boot-reminder, and server-backup-path routes through six position-preserving registrations. It owns full/partial pin and import machinery, the replacement registry, route-only restore failpoints and decode gate, and partial-export GC; shared automatic-snapshot/import-barrier/root state and the streaming-ingest restore gate remain in `server.cjs` and cross through ctx where needed. |
 | `server/node/backup/backupImportIndex.cjs` | Private disk-backed SQLite index for large backup restores. `createBackupImportIndex()` bounds heap use while deduplicating archive names and tracking imported inlays, sidecars, and legacy metadata. |
 | `server/node/backup/mcpToolCallRecovery.cjs` | Remembered MCP tool-call key/snapshot helpers and bounded marker scanners used to fold or recover only referenced `cache/mcp-tool-calls/*` rows across save, export, and import paths. |
-| `server/node/backup/spoolOwnership.cjs` | Validates and atomically initializes persistent UUID files, claims a filesystem-safe installation spool namespace with the separate `__spool_owner_id` plus a canonical-save-root binding, and creates/revalidates the owned child of a configured shared root. Missing identities and claims use fsynced exclusive-link publication; invalid identities deterministically converge without a reclaimable lock pathname. Unsafe entries are atomically parked rather than conditionally unlinked. Identity/claim files and owned directories are accepted without following symlinks and hardened to private modes. Boot cleanup quarantines the claimed child and sweeps through pinned old/fresh directory descriptors; runtime consumers receive only a process-lifetime pinned directory alias. Analytics `__instance_id` is not filesystem ownership. |
+| `server/node/backup/spoolOwnership.cjs` | Validates and atomically initializes persistent UUID files, claims a filesystem-safe installation spool namespace with the separate `__spool_owner_id` plus a canonical-save-root binding, and creates/revalidates the owned child of a configured shared root. Missing identities and claims use fsynced exclusive-link publication; invalid identities deterministically converge without a reclaimable lock pathname. Unsafe entries are atomically parked rather than conditionally unlinked. Identity/claim files and owned directories are accepted without following symlinks; POSIX hosts harden modes. POSIX boot cleanup quarantines the claimed child and sweeps through pinned old/fresh directory descriptors. Windows deliberately skips pathname-unsafe orphan sweeping and gives each process a fresh `.runtime-*` child within the stable owned namespace; stale children are retained for later safe recovery. Analytics `__instance_id` is not filesystem ownership. |
 | `server/node/backup/streamRisuSave.cjs` | Object-based legacy encoder for already-materialized database state and compatibility export paths. |
 | `server/node/backup/streamBackupRisuSave.cjs` | Seekable source-to-source transformer for point-in-time full/partial export and automatic snapshots, including folded external chat/plugin/MCP rows without monolithizing state in memory. |
 | `server/node/backup/streamRisuLoad.cjs` | Bounded streaming inspector/decoder for supported RisuSave formats and snapshot/import ingestion. |
@@ -60,7 +60,7 @@ composition root and cross-subsystem coverage anchors are listed separately.
 | `server/node/chat/chatRows.cjs` | Injected chat-row store and the monolith-ingestion boundary. It owns encoded chat keys, missing/duplicate-ID repair, stub semantics, referenced-row diff/sweep helpers, split/assembly, and the transactional `ingestFullDatabase()` and `ingestStreamingDatabase()` paths. Duplicate `chaId` repair happens before row keys are finalized. |
 | `server/node/chat/characterDefaults.cjs` | Loads `shared/character-defaults-policy.json` and applies its nullish character defaults and missing character/persona/preset ID rules during migration and both monolith-ingest paths. |
 | `server/node/chat/chatDelta.cjs` | Defines and validates the v1 chat-operation envelope and restricted message JSON Patch, then applies a validated delta without weakening base/result commitments. |
-| `server/node/chat/chatBackups.cjs` | Per-chat pre-image history. Ordinary overwrites are best-effort and enforce a 45-second per-chat cooldown; structural chat deletion forces a cooldown-exempt capture and fails closed. Reconciliation streams each loose version into an atomic, self-describing `.frame` containing one independent gzip member, enforces the exact 125-version default plus a 256 MiB per-chat uncompressed-byte default, applies the separate globally age-ordered compressed-disk budget, and restores exact raw bytes by inflating only the selected frame. Legacy solid v1 bundles remain readable and migrate through bounded one-pass extraction without becoming authoritative until every replacement is durable. |
+| `server/node/chat/chatBackups.cjs` | Per-chat pre-image history. Logical IDs use a reversible lowercase-only physical encoding when Windows-reserved, trailing-dot, uppercase/case-colliding, or otherwise non-portable; collision-safe lowercase legacy directory names stay stable and every legacy form remains readable. Ordinary overwrites are best-effort and enforce a 45-second per-chat cooldown; structural chat deletion forces a cooldown-exempt capture and fails closed. Reconciliation streams each loose version into an atomic, self-describing `.frame` containing one independent gzip member, enforces the exact 125-version default plus a 256 MiB per-chat uncompressed-byte default, applies the separate globally age-ordered compressed-disk budget, and restores exact raw bytes by inflating only the selected frame. Legacy solid v1 bundles remain readable and migrate through bounded one-pass extraction without becoming authoritative until every replacement is durable. |
 | `server/node/chat/bufferedIngress.cjs` | Pre-parser admission for buffered JSON, octet-stream, and text bodies, plus identity-only admission for bodyless/direct-stream writers. It resolves auth/writer/route-limit policy, rejects retired protocols and mismatched client builds before reading a body, strictly validates uncompressed `Content-Length`, and reserves/relinquishes the process-wide in-flight byte budget without performing a writer-lock transition. |
 | `server/node/chat/admittedIngressSpool.cjs` | Post-admission disk ingress for raw `/api/write` and raw/JSON chat-row writes. It consumes the already-reserved request in bounded pages, fsyncs a private spool in the installation-owned configured-spool namespace, preserves the reservation through response finish/close, and maps spool-volume pressure to the admission layer's retryable refusal. |
 
@@ -97,6 +97,8 @@ composition root and cross-subsystem coverage anchors are listed separately.
 | `server/node/runtime/session-lock.cjs` | In-memory single-writer authority. `register()` records a boot without stealing; `checkWrite()` distinguishes the active writer, fresh gesture-backed takeover, fresh passive compatibility writes, stale or boot-epoch rejection; `peek()` provides a side-effect-free foreground status. |
 | `server/node/runtime/boundedSessionState.cjs` | Bounded LRU state for per-browser protocol pins. The server uses `createBoundedSessionState()` to retain at most 50 session-scoped plugin-publication read states independently of writer authority. |
 | `server/node/runtime/buildStamp.cjs` | Loads and validates `dist/build-stamp.json` for writer-mutation admission. `readClientBuildStamp()` returns `null` and logs a warning on any read, parse, or shape failure, deliberately disabling the build check rather than blocking the server. |
+| `server/node/runtime/platformFilesystem.cjs`, `portablePath.cjs` | Central platform capability boundaries: directory fsync classification, POSIX-only mode hardening, verified Windows publication retries, file-identity comparison, and reversible Windows-safe physical filename encoding. |
+| `server/node/runtime/gracefulShutdown.cjs`, `archiveExtraction.cjs` | Idempotent multi-signal shutdown registration and shell-free update archive extraction. Windows ZIP extraction prefers argument-array `tar.exe` and falls back to encoded PowerShell `Expand-Archive`. |
 | `server/node/runtime/model-jobs.cjs` | Durable upstream model relay. `createModelJobs()` stores non-secret job metadata in `save/model-jobs.db`, records exact provider response bytes in append-only journals under `save/model-jobs/`, tails running streams, supports claims, and owns 48-hour pending-send tombstones. Main jobs are recoverable; auxiliary pipeline requests are relay-only. |
 | `server/node/runtime/logs.cjs` | Separate SQLite-backed client/server diagnostic log sink in `save/logs.db`. It masks credentials, batches writes, builds the server logger, installs fatal process handlers (accepting an `onFatalExit` callback that `server.cjs` wires to the emergency database flush), and records otherwise-unlogged Express errors. This is distinct from provider request history and usage in `request-logs.cjs`. |
 | `server/node/runtime/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
@@ -142,8 +144,9 @@ composition root and cross-subsystem coverage anchors are listed separately.
    admission and is logged; any read/parse/shape failure logs a warning and returns `null`,
    so build admission is fail-open. The server then creates `save/`, validates or atomically
    creates its analytics and separate spool-owner identities, completes the canonical-save-root
-   claim/reseed before any owned-child operation, quarantines and descriptor-pins that spool
-   owner's prior database-assembly/admitted-ingress namespace for cleanup, resolves the
+   claim/reseed before any owned-child operation, then either quarantines and descriptor-pins
+   that spool owner's prior namespace for POSIX cleanup or creates a fresh retained-per-boot
+   Windows runtime child, resolves the
    independent chat-history root, migrates legacy history from the configured
    server-backup directory, reads or creates the password/JWT files, loads
    persisted direct-asset sessions, initializes the server-backup directory, and registers
@@ -182,7 +185,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `POCKETRISU_CHAT_BACKUP_DIR` | Overrides the final chat-history directory. Absolute paths are used directly; relative paths resolve from `process.cwd()`. The default is `<savePath>/chat-backups` (normally `save/chat-backups`, or `/app/save/chat-backups` in Docker). This operator setting also applies in hub mode and is independent of the server-file-backup path/API. |
 | `POCKETRISU_CHAT_BACKUP_MAX_BYTES` | Overrides the global per-chat-history budget in bytes. Default 50 MiB; clamped to 1 MiB–50 GiB. It takes precedence over the `config/chat-backup-max-bytes` KV setting. |
 | `POCKETRISU_CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES` | Overrides the per-chat retained uncompressed-byte cap. Default 256 MiB; clamped to 1 MiB–50 GiB. It takes precedence over `config/chat-backup-max-uncompressed-bytes`. The newest recovery point remains protected when it alone exceeds the cap. |
-| `POCKETRISU_SPOOL_DIR` | Relocates the shared root for admitted ingress, database assembly, decoded stream loads, archive/import staging, plugin-value uploads, and snapshot-restore spools. Default `save/.spool`; those consumers use a stable `.instance-<sha256(__spool_owner_id)>/` child, so installations may share the configured root without sharing boot cleanup ownership. A private sibling claim binds that UUID to the canonical save root; a save-tree clone under a different path therefore deterministically reseeds its copied owner UUID before any child validation or cleanup. Identity repair and exclusive claim publication do not use a reclaimable lock pathname. Invalid or unsafe identity objects are regenerated or atomically parked without following symlinks. After boot, all consumers use a process-lifetime pinned fd alias rather than the mutable child pathname; platforms without a validated descriptor-relative alias fail spool readiness safely. Unowned legacy root files and other owner namespaces are preserved. Production decoded-load boundaries fail closed when that pinned spool is unavailable; boot recognizes and reaps the shared canonical and legacy decoded-name families inside the owned namespace. This setting does not relocate filesystem export pins or plugin transition stages. |
+| `POCKETRISU_SPOOL_DIR` | Relocates the shared root for admitted ingress, database assembly, decoded stream loads, archive/import staging, plugin-value uploads, and snapshot-restore spools. Default `save/.spool`; those consumers use a stable `.instance-<sha256(__spool_owner_id)>/` namespace, so installations may share the configured root without sharing ownership. A private sibling claim binds that UUID to the canonical save root; a save-tree clone under a different path therefore deterministically reseeds its copied owner UUID before any child validation or cleanup. Identity repair and exclusive claim publication do not use a reclaimable lock pathname. Invalid or unsafe identity objects are regenerated or atomically parked without following symlinks. POSIX consumers use a process-lifetime pinned descriptor alias and boot reaps recognized families through pinned identities. Windows consumers use a unique `.runtime-*` child per process because Node has no equivalent safe directory-descriptor namespace; startup never recursively sweeps the stable pathname, and stale runtime children remain retained. Unowned legacy root files and other owner namespaces are preserved. This setting does not relocate filesystem export pins or plugin transition stages. |
 | `POCKETRISU_PLUGIN_VALUE_MAX_BYTES` | Per optimized-plugin value cap; default 128 MiB. |
 | `POCKETRISU_PLUGIN_STORAGE_MAX_BYTES` | Aggregate optimized-plugin cap; default 1 GiB. |
 | `POCKETRISU_BUFFERED_INGRESS_MAX_BYTES` | Process-wide budget for concurrently admitted buffered request bodies; default 512 MiB. Every buffered route ceiling is also capped by this value. |
@@ -286,7 +289,8 @@ inside `queueStorageMutation()` immediately before the transactional publication
 │   │   └── request-*.json.gz            # newest 500 non-streaming HTTP exchanges
 │   ├── .spool/                         # configured spool root (default)
 │   │   ├── .instance-<owner-sha256>.claim # canonical-save-root namespace claim
-│   │   └── .instance-<owner-sha256>/   # this installation's swept temporary spools
+│   │   └── .instance-<owner-sha256>/   # this installation's owned namespace
+│   │       └── .runtime-*/             # Windows per-process spool (retained if stale)
 │   ├── .partial-export-spool/          # private full/partial filesystem pins
 │   ├── .plugin-transition-staging/     # durable staged plugin mode changes
 │   ├── assets/
@@ -778,7 +782,7 @@ are sent to the ordinary application log; it adds no provider API.
 - `ws` supplies the proxy-job WebSocket server in `server/node/runtime/proxy.cjs`.
 - `wasm-vips` generates thumbnails and compresses inlays at `server/node/server.cjs:25`.
 - Native `fetch` calls arbitrary authenticated proxy targets, `https://sv.risuai.xyz` for Hub traffic, Google OAuth, the configured PocketRisu update worker, and GitHub release assets.
-- `child_process.spawn()` runs restart helpers; `execSync()` invokes platform archive tools during self-update.
+- `child_process.spawn()` runs restart helpers; `execFileSync()` invokes archive tools with literal argument arrays during self-update.
 - `server/hono/` depends only on Hono and `@hono/node-server`, declared at `server/hono/package.json:11`; it does not reuse the Node database, serialization, or route code.
 
 ## 5. Conventions & gotchas
@@ -970,8 +974,8 @@ are sent to the ordinary application log; it adds no provider API.
   deletion because a removed sibling can make shared chunks exclusive to a survivor.
 
 - Snapshot assembly is independent of file backups. Temporary `database.risudat` files
-  belong in the installation-owned child of `save/.spool` or `POCKETRISU_SPOOL_DIR`, never
-  under the optional server-backup path. Boot first completes the namespace claim, atomically
+  belong in the installation-owned namespace of `save/.spool` or `POCKETRISU_SPOOL_DIR`, never
+  under the optional server-backup path. On POSIX, boot first completes the namespace claim, atomically
   quarantines only that stable child, creates a fresh private child, compares the pinned old
   identity to the pre-rename source, and sweeps through pinned old/fresh descriptors. Recognized
   artifacts are removed through the old fd; unrelated regular files publish create-only into the
@@ -987,7 +991,9 @@ are sent to the ordinary application log; it adds no provider API.
   database flushes feed this same scheduler rather than assembling against live rows.
   Canonical and legacy decoded stream-load temporaries use shared name families in
   the same configured owned child and are recognized by its boot sweep. Production
-  decode boundaries fail closed when that pinned spool is unavailable.
+  decode boundaries fail closed when that pinned spool is unavailable. On Windows, runtime
+  consumers instead share a unique `.runtime-*` child created for that process; boot and exit
+  never recursively delete a reusable namespace pathname, so stale children are retained.
 
 - Automatic snapshot timestamps use 100 ms units. Creation divides `Date.now()` by 100;
   listing multiplies the parsed value by 100.
@@ -1029,7 +1035,9 @@ are sent to the ordinary application log; it adds no provider API.
 
 - Self-update is portable-only and mutates the installation tree. Only a `.portable`
   deployment can enter the replacement flow. The keep sets, rollback staging, Windows
-  locked-binary handling, and restart logic are data-safety behavior.
+  locked-binary handling, and restart logic are data-safety behavior. Archive paths are
+  passed to tools as literal arguments, generated batch paths escape percent expansion,
+  and the native launcher uses dynamic buffers plus a long-path-aware manifest.
 
 - Logs are a separate bounded database. Rows are rotated to approximately 5,000, descriptions are truncated, and common JWT/API-key patterns are masked before persistence (`server/node/runtime/logs.cjs:8`, `server/node/runtime/logs.cjs:62`). Keep the server `BACKGROUND_SOURCES` list synchronized with the frontend logs settings as noted at `server/node/runtime/logs.cjs:55`.
 

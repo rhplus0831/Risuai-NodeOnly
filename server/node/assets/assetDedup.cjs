@@ -3,6 +3,9 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const {
+    fsyncDirectorySync: fsyncPlatformDirectorySync,
+} = require('../runtime/platformFilesystem.cjs');
 const { isSafeAssetName } = require('./assetStore.cjs');
 const {
     acquireAssetMaintenanceLockSync,
@@ -37,21 +40,7 @@ function wait(delayMs) {
 }
 
 function fsyncDirectorySync(directory, fsOps = fs) {
-    let descriptor;
-    try {
-        descriptor = fsOps.openSync(directory, 'r');
-        fsOps.fsyncSync(descriptor);
-    } catch (error) {
-        if (!['EINVAL', 'ENOTSUP'].includes(error?.code)
-            && !(process.platform === 'win32'
-                && ['EACCES', 'EISDIR', 'EPERM'].includes(error?.code))) {
-            throw error;
-        }
-    } finally {
-        if (descriptor !== undefined) {
-            try { fsOps.closeSync(descriptor); } catch {}
-        }
-    }
+    return fsyncPlatformDirectorySync(directory, { fs: fsOps });
 }
 
 function dedupMetadataFromStat(stat, label = 'Filesystem entry') {

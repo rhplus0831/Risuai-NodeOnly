@@ -2,6 +2,10 @@
 
 const defaultFs = require('fs');
 const path = require('path');
+const {
+    fsyncDirectorySync,
+    renamePublishedFileSync,
+} = require('../runtime/platformFilesystem.cjs');
 
 const JOURNAL_PHASES = new Set(['swapped', 'committed']);
 
@@ -9,7 +13,7 @@ function isMissing(error) {
     return error?.code === 'ENOENT';
 }
 
-function fsyncPath(filePath, fsOps) {
+function fsyncFilePath(filePath, fsOps) {
     let fd;
     try {
         fd = fsOps.openSync(filePath, 'r');
@@ -27,8 +31,11 @@ function fsyncPath(filePath, fsOps) {
     }
 }
 
-function fsyncParentDirectory(filePath, fsOps) {
-    fsyncPath(path.dirname(filePath), fsOps);
+function fsyncParentDirectory(filePath, fsOps, options = {}) {
+    fsyncDirectorySync(path.dirname(filePath), {
+        fs: fsOps,
+        platform: options.platform,
+    });
 }
 
 function isValidImportJournal(state) {
@@ -54,23 +61,26 @@ function isValidImportJournal(state) {
     );
 }
 
-function writeImportJournal(journalPath, state, fsOps = defaultFs) {
+function writeImportJournal(journalPath, state, fsOps = defaultFs, options = {}) {
     if (!isValidImportJournal(state)) {
         throw new TypeError('Invalid import journal state');
     }
     const tmpPath = `${journalPath}.tmp`;
     fsOps.writeFileSync(tmpPath, JSON.stringify(state), 'utf-8');
-    fsyncPath(tmpPath, fsOps);
-    fsOps.renameSync(tmpPath, journalPath);
-    fsyncParentDirectory(journalPath, fsOps);
+    fsyncFilePath(tmpPath, fsOps);
+    renamePublishedFileSync(tmpPath, journalPath, {
+        fs: fsOps,
+        platform: options.platform,
+    });
+    fsyncParentDirectory(journalPath, fsOps, options);
 }
 
-function readImportJournal(journalPath, fsOps = defaultFs) {
+function readImportJournal(journalPath, fsOps = defaultFs, options = {}) {
     const tmpPath = `${journalPath}.tmp`;
     try {
         if (fsOps.existsSync(tmpPath)) {
             fsOps.rmSync(tmpPath, { force: true });
-            fsyncParentDirectory(journalPath, fsOps);
+            fsyncParentDirectory(journalPath, fsOps, options);
         }
     } catch (error) {
         if (!isMissing(error)) throw error;
@@ -85,7 +95,7 @@ function readImportJournal(journalPath, fsOps = defaultFs) {
     }
 }
 
-function clearImportJournal(journalPath, fsOps = defaultFs) {
+function clearImportJournal(journalPath, fsOps = defaultFs, options = {}) {
     for (const target of [journalPath, `${journalPath}.tmp`]) {
         try {
             fsOps.rmSync(target, { force: true });
@@ -93,10 +103,10 @@ function clearImportJournal(journalPath, fsOps = defaultFs) {
             if (!isMissing(error)) throw error;
         }
     }
-    fsyncParentDirectory(journalPath, fsOps);
+    fsyncParentDirectory(journalPath, fsOps, options);
 }
 
-function fsyncDirectoryTree(dir, fsOps = defaultFs) {
+function fsyncDirectoryTree(dir, fsOps = defaultFs, options = {}) {
     let entries;
     try {
         entries = fsOps.readdirSync(dir, { withFileTypes: true });
@@ -115,12 +125,12 @@ function fsyncDirectoryTree(dir, fsOps = defaultFs) {
             throw error;
         }
         if (stat.isDirectory()) {
-            fsyncDirectoryTree(entryPath, fsOps);
+            fsyncDirectoryTree(entryPath, fsOps, options);
         } else if (stat.isFile()) {
-            fsyncPath(entryPath, fsOps);
+            fsyncFilePath(entryPath, fsOps);
         }
     }
-    fsyncPath(dir, fsOps);
+    fsyncDirectorySync(dir, { fs: fsOps, platform: options.platform });
 }
 
 function recoverImportSwap({ journal, markerPresent, fs: fsOps = defaultFs }) {

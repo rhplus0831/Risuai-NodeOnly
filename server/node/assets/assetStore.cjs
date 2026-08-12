@@ -4,6 +4,11 @@ const fs = require('fs');
 const path = require('path');
 const { createHash, randomUUID } = require('crypto');
 const {
+    isPortableWindowsFileName,
+    portableFilenameKey,
+} = require('../runtime/portablePath.cjs');
+const { renamePublishedFileSync } = require('../runtime/platformFilesystem.cjs');
+const {
     acquireAssetMaintenanceLockSync,
     canonicalAssetDirectoryIdentitySync,
     releaseAssetMaintenanceLockHandle,
@@ -17,7 +22,6 @@ const LEGACY_HASH_MARKER_DIR = '.legacy-hash-assets';
 const LEGACY_HASH_MARKER_VALUE = 'legacy-hash-asset-v1\n';
 const SAFE_ASSET_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const HASH_NAME_RE = /^assets\/([0-9a-f]{64})\.[A-Za-z0-9]{1,10}$/;
-const WINDOWS_RESERVED_ASSET_BASENAME_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
 
 function isSafeAssetName(name) {
     return typeof name === 'string'
@@ -27,13 +31,11 @@ function isSafeAssetName(name) {
 }
 
 function portableAssetNameKey(name) {
-    return name.toLowerCase().replace(/\.+$/, '');
+    return portableFilenameKey(name);
 }
 
 function isPortableAssetName(name) {
-    if (!isSafeAssetName(name) || name.endsWith('.')) return false;
-    const basename = name.split('.', 1)[0].toLowerCase();
-    return !WINDOWS_RESERVED_ASSET_BASENAME_RE.test(basename);
+    return isSafeAssetName(name) && isPortableWindowsFileName(name);
 }
 
 function verifyAssetHash(key, buffer) {
@@ -233,7 +235,7 @@ function createAssetStore(options = {}) {
             fsOps.fsyncSync(fd);
             fsOps.closeSync(fd);
             fd = undefined;
-            fsOps.renameSync(tempPath, filePath);
+            renamePublishedFileSync(tempPath, filePath, { fs: fsOps });
             fsyncDirectory(directory);
         } finally {
             if (fd !== undefined) {
@@ -319,7 +321,7 @@ function createAssetStore(options = {}) {
             fd = undefined;
 
             if (beforePublish) beforePublish();
-            fsOps.renameSync(tempPath, destination);
+            renamePublishedFileSync(tempPath, destination, { fs: fsOps });
             tempPath = undefined;
 
             // Persist the directory-entry swap where the platform supports it.
@@ -438,7 +440,7 @@ function createAssetStore(options = {}) {
             fsOps.fsyncSync(destinationDescriptor);
             fsOps.closeSync(destinationDescriptor);
             destinationDescriptor = undefined;
-            fsOps.renameSync(tempPath, destination);
+            renamePublishedFileSync(tempPath, destination, { fs: fsOps });
             tempPath = undefined;
             fsyncDirectory(assetDir);
             return true;

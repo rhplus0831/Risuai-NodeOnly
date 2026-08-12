@@ -3,17 +3,21 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const {
+    fsyncDirectorySync,
+    hardenPrivateDescriptorSync,
+    sameFileIdentity,
+} = require('../runtime/platformFilesystem.cjs');
 
 const SPOOL_OWNER_ID_FILENAME = '__spool_owner_id';
 const OWNED_SPOOL_DIR_PREFIX = '.instance-';
 const OWNED_SPOOL_CLAIM_SUFFIX = '.claim';
+const RUNTIME_SPOOL_DIR_PREFIX = '.runtime-';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CLAIM_PATTERN = /^v1:([0-9a-f]{64})$/;
-const DIRECTORY_FSYNC_UNSUPPORTED_CODES = new Set([
+const SPOOL_DIRECTORY_FSYNC_UNSUPPORTED_CODES = new Set([
     'EACCES',
-    'EINVAL',
     'EISDIR',
-    'ENOTSUP',
     'EPERM',
 ]);
 
@@ -29,11 +33,6 @@ function lstatOrNull(filePath, fsOps = fs) {
         if (error?.code === 'ENOENT') return null;
         throw error;
     }
-}
-
-function sameFileIdentity(left, right) {
-    if (!left || !right) return false;
-    return left.dev === right.dev && left.ino === right.ino;
 }
 
 function closeDescriptor(descriptor, fsOps = fs) {
@@ -58,10 +57,11 @@ function openRegularFileNoFollow(filePath, fsOps = fs, { harden = false } = {}) 
         // repeats on every boot, and fsync on this read-only handle can fail
         // with EPERM. Keep the no-follow/type/identity checks on Windows, but
         // leave access control to the filesystem ACLs.
-        if (harden && process.platform !== 'win32' && (after.mode & 0o777) !== 0o600) {
-            fsOps.fchmodSync(descriptor, 0o600);
-            fsOps.fsyncSync(descriptor);
-        }
+        if (harden) hardenPrivateDescriptorSync(descriptor, 0o600, {
+            fs: fsOps,
+            stat: after,
+            sync: true,
+        });
         return { descriptor, stat: after };
     } catch (error) {
         if (descriptor !== null) {
@@ -91,25 +91,10 @@ function readUuid(filePath, fsOps = fs) {
 }
 
 function fsyncDirectory(directoryPath, fsOps = fs) {
-    let descriptor;
-    let pendingError = null;
-    try {
-        descriptor = fsOps.openSync(directoryPath, 'r');
-        fsOps.fsyncSync(descriptor);
-    } catch (error) {
-        if (!DIRECTORY_FSYNC_UNSUPPORTED_CODES.has(error?.code)) pendingError = error;
-    } finally {
-        if (descriptor !== undefined) {
-            try {
-                fsOps.closeSync(descriptor);
-            } catch (error) {
-                if (!DIRECTORY_FSYNC_UNSUPPORTED_CODES.has(error?.code) && !pendingError) {
-                    pendingError = error;
-                }
-            }
-        }
-    }
-    if (pendingError) throw pendingError;
+    fsyncDirectorySync(directoryPath, {
+        fs: fsOps,
+        additionalUnsupportedCodes: SPOOL_DIRECTORY_FSYNC_UNSUPPORTED_CODES,
+    });
 }
 
 function canonicalPath(filePath, fsOps = fs) {
@@ -136,7 +121,7 @@ function writePrivateTempFile(temporaryPath, value, fsOps = fs) {
     try {
         descriptor = fsOps.openSync(temporaryPath, 'wx', 0o600);
         fsOps.writeFileSync(descriptor, value, 'utf8');
-        fsOps.fchmodSync(descriptor, 0o600);
+        hardenPrivateDescriptorSync(descriptor, 0o600, { fs: fsOps });
         fsOps.fsyncSync(descriptor);
         closeDescriptor(descriptor, fsOps);
         descriptor = null;
@@ -257,9 +242,13 @@ function claimOwnedSpoolNamespaceSync(savePath, spoolRoot, options = {}) {
     throw new Error('Could not claim a collision-free spool namespace');
 }
 
-function openOwnedDirectoryNoFollow(directoryPath, fsOps = fs) {
+function openOwnedDirectoryNoFollow(directoryPath, fsOps = fs, options = {}) {
+    const platform = options.platform ?? process.platform;
     const before = lstatOrNull(directoryPath, fsOps);
     if (!before || !before.isDirectory()) return null;
+    if (platform === 'win32') {
+        return { descriptor: null, stat: before };
+    }
     const flags = fs.constants.O_RDONLY
         | (fs.constants.O_DIRECTORY ?? 0)
         | (fs.constants.O_NOFOLLOW ?? 0);
@@ -271,7 +260,11 @@ function openOwnedDirectoryNoFollow(directoryPath, fsOps = fs) {
             closeDescriptor(descriptor, fsOps);
             return null;
         }
-        if ((after.mode & 0o777) !== 0o700) fsOps.fchmodSync(descriptor, 0o700);
+        hardenPrivateDescriptorSync(descriptor, 0o700, {
+            fs: fsOps,
+            platform,
+            stat: after,
+        });
         return { descriptor, stat: after };
     } catch (error) {
         if (descriptor !== null) {
@@ -284,6 +277,7 @@ function openOwnedDirectoryNoFollow(directoryPath, fsOps = fs) {
 
 function ensureOwnedSpoolDirSync(spoolRoot, ownedSpoolDir, options = {}) {
     const fsOps = options.fs ?? fs;
+    const platform = options.platform ?? process.platform;
     fsOps.mkdirSync(spoolRoot, { recursive: true });
     if (!fsOps.statSync(spoolRoot).isDirectory()) {
         const error = new Error('Configured spool root must be a directory');
@@ -313,7 +307,7 @@ function ensureOwnedSpoolDirSync(spoolRoot, ownedSpoolDir, options = {}) {
                 if (error?.code !== 'EEXIST') throw error;
             }
         }
-        const opened = openOwnedDirectoryNoFollow(ownedSpoolDir, fsOps);
+        const opened = openOwnedDirectoryNoFollow(ownedSpoolDir, fsOps, { platform });
         if (!opened) continue;
         closeDescriptor(opened.descriptor, fsOps);
         return ownedSpoolDir;
@@ -352,6 +346,89 @@ function openPinnedOwnedSpoolDirSync(ownedSpoolDir, options = {}) {
     };
 }
 
+function createPathRuntimeSpoolDirSync(spoolRoot, ownedSpoolDir, options = {}) {
+    const fsOps = options.fs ?? fs;
+    const platform = options.platform ?? process.platform;
+    ensureOwnedSpoolDirSync(spoolRoot, ownedSpoolDir, { fs: fsOps, platform });
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+        const runtimePath = path.join(
+            ownedSpoolDir,
+            `${RUNTIME_SPOOL_DIR_PREFIX}${process.pid}-${crypto.randomUUID()}`,
+        );
+        try {
+            fsOps.mkdirSync(runtimePath, { mode: 0o700 });
+        } catch (error) {
+            if (error?.code === 'EEXIST' && attempt < 9) continue;
+            throw error;
+        }
+        const stat = fsOps.lstatSync(runtimePath);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) {
+            const error = new Error('Runtime spool path must be a real directory');
+            error.code = 'ENOTDIR';
+            throw error;
+        }
+        return {
+            cleanupPath: runtimePath,
+            descriptor: null,
+            kind: 'path',
+            pinnedPath: runtimePath,
+            stat,
+        };
+    }
+    throw new Error('Could not create a collision-free runtime spool directory');
+}
+
+function openRuntimeOwnedSpoolDirSync(spoolRoot, ownedSpoolDir, options = {}) {
+    const platform = options.platform ?? process.platform;
+    if (platform === 'win32') {
+        return createPathRuntimeSpoolDirSync(spoolRoot, ownedSpoolDir, options);
+    }
+    ensureOwnedSpoolDirSync(spoolRoot, ownedSpoolDir, options);
+    const opened = openPinnedOwnedSpoolDirSync(ownedSpoolDir, options);
+    return opened ? { ...opened, cleanupPath: null, kind: 'descriptor' } : null;
+}
+
+function validateRuntimeOwnedSpoolDirSync(handle, options = {}) {
+    if (!handle) return false;
+    const fsOps = options.fs ?? fs;
+    try {
+        const current = handle.descriptor === null || handle.descriptor === undefined
+            ? fsOps.lstatSync(handle.pinnedPath)
+            : fsOps.fstatSync(handle.descriptor);
+        return current.isDirectory()
+            && !current.isSymbolicLink()
+            && sameFileIdentity(current, handle.stat);
+    } catch {
+        return false;
+    }
+}
+
+function releaseRuntimeOwnedSpoolDirSync(handle, options = {}) {
+    if (!handle) return false;
+    const fsOps = options.fs ?? fs;
+    let released = false;
+    if (handle.descriptor !== null && handle.descriptor !== undefined) {
+        try {
+            closeDescriptor(handle.descriptor, fsOps);
+            released = true;
+        } catch {}
+    }
+    if (handle.cleanupPath && validateRuntimeOwnedSpoolDirSync(handle, { fs: fsOps })) {
+        try {
+            // Runtime consumers remove their own artifacts. Remove only an
+            // empty directory here so cleanup never recursively follows a
+            // path that could have changed after validation.
+            fsOps.rmdirSync(handle.cleanupPath);
+            released = true;
+        } catch (error) {
+            if (!['ENOENT', 'ENOTEMPTY', 'EEXIST', 'EBUSY', 'EPERM'].includes(error?.code)) {
+                throw error;
+            }
+        }
+    }
+    return released;
+}
+
 function withQuarantinedOwnedSpoolDirSync(
     spoolRoot,
     ownedSpoolDir,
@@ -359,7 +436,12 @@ function withQuarantinedOwnedSpoolDirSync(
     options = {},
 ) {
     const fsOps = options.fs ?? fs;
+    const platform = options.platform ?? process.platform;
     const hooks = options.hooks ?? {};
+    if (platform === 'win32') {
+        ensureOwnedSpoolDirSync(spoolRoot, ownedSpoolDir, { fs: fsOps, platform });
+        return { quarantined: false, swept: false, unsupported: true };
+    }
     fsOps.mkdirSync(spoolRoot, { recursive: true });
     if (!fsOps.statSync(spoolRoot).isDirectory()) {
         const error = new Error('Configured spool root must be a directory');
@@ -449,6 +531,7 @@ module.exports = {
     SPOOL_OWNER_ID_FILENAME,
     OWNED_SPOOL_DIR_PREFIX,
     OWNED_SPOOL_CLAIM_SUFFIX,
+    RUNTIME_SPOOL_DIR_PREFIX,
     UUID_PATTERN,
     canonicalUuid,
     readOrCreatePersistentUuid,
@@ -456,6 +539,9 @@ module.exports = {
     resolveOwnedSpoolDirFromSave,
     claimOwnedSpoolNamespaceSync,
     ensureOwnedSpoolDirSync,
+    openRuntimeOwnedSpoolDirSync,
     openPinnedOwnedSpoolDirSync,
+    releaseRuntimeOwnedSpoolDirSync,
+    validateRuntimeOwnedSpoolDirSync,
     withQuarantinedOwnedSpoolDirSync,
 };

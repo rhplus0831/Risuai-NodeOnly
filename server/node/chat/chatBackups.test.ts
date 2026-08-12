@@ -81,6 +81,8 @@ const {
     resolveChatBackupDir,
     resolveChatBackupMaxBytes,
     resolveChatBackupMaxUncompressedBytes,
+    encodePathComponent,
+    decodePathComponent,
     sanitizeBackupReason,
     isDestructiveBackupReason,
     CHAT_BACKUP_MAX_BYTES_KEY,
@@ -98,6 +100,8 @@ const {
     resolveChatBackupDir: (options?: any) => string
     resolveChatBackupMaxBytes: (options?: any) => number
     resolveChatBackupMaxUncompressedBytes: (options?: any) => number
+    encodePathComponent: (value: string) => string
+    decodePathComponent: (value: string) => string | null
     sanitizeBackupReason: (reason?: unknown) => string
     isDestructiveBackupReason: (reason?: unknown) => boolean
     CHAT_BACKUP_MAX_BYTES_KEY: string
@@ -105,6 +109,19 @@ const {
     FRAME_FORMAT: string
     COLD_STORAGE_HEADER: string
 }
+
+describe('chat backup path encoding', () => {
+    it('keeps portable names stable and escapes Windows-reserved names', () => {
+        expect(encodePathComponent('character-01')).toBe('character-01')
+        expect(decodePathComponent('character-01')).toBe('character-01')
+
+        const encoded = encodePathComponent('CON')
+        expect(encoded).not.toBe('CON')
+        expect(decodePathComponent(encoded)).toBe('CON')
+        expect(decodePathComponent('CON')).toBe('CON')
+    })
+})
+
 const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
     decodeRisuSave: (value: Buffer | Uint8Array) => Promise<any>
     encodeRisuSaveLegacy: (value: any) => Uint8Array

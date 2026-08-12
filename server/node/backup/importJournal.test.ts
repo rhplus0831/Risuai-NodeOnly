@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -10,7 +10,12 @@ const {
     clearImportJournal,
     recoverImportSwap,
 } = pkg as {
-    writeImportJournal: (journalPath: string, journal: ImportJournal, fsImpl?: typeof fs) => void
+    writeImportJournal: (
+        journalPath: string,
+        journal: ImportJournal,
+        fsImpl?: typeof fs,
+        options?: { platform?: string },
+    ) => void
     readImportJournal: (journalPath: string, fsImpl?: typeof fs) => ImportJournal | null
     clearImportJournal: (journalPath: string, fsImpl?: typeof fs) => void
     recoverImportSwap: (options: {
@@ -96,6 +101,29 @@ describe('import journal persistence', () => {
         expect(recoverPending(journalPath, false)).toBeNull()
         expect(fs.existsSync(`${journalPath}.tmp`)).toBe(false)
         expect(fs.readFileSync(path.join(liveDir, 'original.bin'), 'utf-8')).toBe('original')
+    })
+
+    it('keeps file fsync mandatory while treating Windows directory fsync as best effort', () => {
+        const root = makeRoot()
+        const journalPath = path.join(root, 'import_journal.json')
+        const fsOps = Object.create(fs) as typeof fs
+        fsOps.fsyncSync = vi.fn((descriptor: number) => {
+            if (fs.fstatSync(descriptor).isDirectory()) {
+                throw Object.assign(new Error('Windows directory fsync is unavailable'), {
+                    code: 'EPERM',
+                })
+            }
+            return fs.fsyncSync(descriptor)
+        }) as typeof fs.fsyncSync
+
+        expect(() => writeImportJournal(
+            journalPath,
+            journalFor([makeDirState(root, 'assets')]),
+            fsOps,
+            { platform: 'win32' },
+        )).not.toThrow()
+        expect(readImportJournal(journalPath)).not.toBeNull()
+        expect(fsOps.fsyncSync).toHaveBeenCalled()
     })
 })
 

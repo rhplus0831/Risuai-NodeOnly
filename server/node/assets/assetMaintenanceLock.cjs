@@ -4,6 +4,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const {
+    fsyncDirectorySync: fsyncPlatformDirectorySync,
+} = require('../runtime/platformFilesystem.cjs');
 
 const ASSET_MAINTENANCE_LOCK_NAME = '__asset_maintenance.lock';
 const ASSET_MAINTENANCE_LOCK_OWNER = 'owner.json';
@@ -16,31 +19,8 @@ const RECOVERY_STAGE_RE = /^\.recover-stage-([0-9a-f]{16})-([1-9][0-9]{0,15})-([
 const RECOVERY_INTENT_RE = /^\.recover-([0-9a-f]{64})$/;
 const activeOwnerStages = new Set();
 
-function directoryFsyncErrorIsUnsupported(error, platform = process.platform) {
-    if (error?.code === 'EINVAL' || error?.code === 'ENOTSUP') return true;
-    return platform === 'win32' && ['EACCES', 'EISDIR', 'EPERM'].includes(error?.code);
-}
-
 function fsyncDirectorySync(directoryPath, fsOps = fs, platform = process.platform) {
-    let descriptor;
-    let pendingError = null;
-    try {
-        descriptor = fsOps.openSync(directoryPath, 'r');
-        fsOps.fsyncSync(descriptor);
-    } catch (error) {
-        if (!directoryFsyncErrorIsUnsupported(error, platform)) pendingError = error;
-    } finally {
-        if (descriptor !== undefined) {
-            try {
-                fsOps.closeSync(descriptor);
-            } catch (error) {
-                if (!directoryFsyncErrorIsUnsupported(error, platform) && !pendingError) {
-                    pendingError = error;
-                }
-            }
-        }
-    }
-    if (pendingError) throw pendingError;
+    fsyncPlatformDirectorySync(directoryPath, { fs: fsOps, platform });
 }
 
 function assetDirectorySymlinkError(assetDir) {

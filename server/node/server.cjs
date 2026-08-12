@@ -10,7 +10,6 @@ const {
     existsSync,
     mkdirSync,
     readFileSync,
-    renameSync,
     writeFileSync,
     readdirSync,
     unlinkSync,
@@ -28,6 +27,12 @@ const v8 = require('v8')
 const rateLimit = require('express-rate-limit')
 const WRITER_EPOCH_HEADER = 'x-writer-epoch'
 const sessionLock = createSessionLock()
+const { isPortableWindowsFileName } = require('./runtime/portablePath.cjs')
+const {
+    renamePublishedFile,
+    renamePublishedFileSync,
+} = require('./runtime/platformFilesystem.cjs')
+const { installGracefulShutdownHandlers } = require('./runtime/gracefulShutdown.cjs')
 
 function getSessionLockEpoch() {
     return sessionLock.epoch();
@@ -324,8 +329,9 @@ const {
     readOrCreatePersistentUuid,
     resolveOwnedSpoolDir,
     claimOwnedSpoolNamespaceSync,
-    ensureOwnedSpoolDirSync,
-    openPinnedOwnedSpoolDirSync,
+    openRuntimeOwnedSpoolDirSync,
+    releaseRuntimeOwnedSpoolDirSync,
+    validateRuntimeOwnedSpoolDirSync,
     withQuarantinedOwnedSpoolDirSync,
 } = require('./backup/spoolOwnership.cjs');
 const {
@@ -2903,8 +2909,11 @@ function getPluginTransitionStageDir() {
 function ensureDatabaseSpoolDirSync() {
     try {
         if (databaseSpoolHandle) {
-            if (!fsSync.fstatSync(databaseSpoolHandle.descriptor).isDirectory()) {
-                throw new Error('Pinned database spool descriptor is no longer a directory');
+            if (!validateRuntimeOwnedSpoolDirSync(databaseSpoolHandle)) {
+                releaseRuntimeOwnedSpoolDirSync(databaseSpoolHandle);
+                databaseSpoolHandle = null;
+                databaseSpoolDir = null;
+                throw new Error('Runtime database spool is no longer the opened directory');
             }
             databaseSpoolReady = true;
             return true;
@@ -2915,8 +2924,10 @@ function ensureDatabaseSpoolDirSync() {
             databaseSpoolOwnedPath = claimed.spoolDir;
             databaseSpoolNamespaceClaimed = true;
         }
-        ensureOwnedSpoolDirSync(databaseSpoolRootDir, databaseSpoolOwnedPath);
-        const opened = openPinnedOwnedSpoolDirSync(databaseSpoolOwnedPath);
+        const opened = openRuntimeOwnedSpoolDirSync(
+            databaseSpoolRootDir,
+            databaseSpoolOwnedPath,
+        );
         if (!opened) {
             const error = new Error('Descriptor-relative database spool access is unavailable');
             error.code = 'ENOTSUP';
@@ -2931,6 +2942,16 @@ function ensureDatabaseSpoolDirSync() {
         return false;
     }
 }
+
+function releaseDatabaseSpoolSync() {
+    const handle = databaseSpoolHandle;
+    databaseSpoolHandle = null;
+    databaseSpoolDir = null;
+    databaseSpoolReady = false;
+    if (handle) releaseRuntimeOwnedSpoolDirSync(handle);
+}
+
+process.once('exit', releaseDatabaseSpoolSync);
 function requireDatabaseSpoolDirSync() {
     if (ensureDatabaseSpoolDirSync()) return databaseSpoolDir;
     const error = new Error(`The configured database spool is unavailable: ${databaseSpoolOwnedPath}`);
@@ -3095,7 +3116,7 @@ function writePluginTransitionStage(stage) {
         } finally {
             closeSync(fileDescriptor);
         }
-        renameSync(temporaryPath, metaPath);
+        renamePublishedFileSync(temporaryPath, metaPath);
         fsyncPluginTransitionStageDirectory();
     } catch (error) {
         try { unlinkSync(temporaryPath); } catch {}
@@ -3959,14 +3980,18 @@ function getInlaySidecarPath(id) {
 
 function getLegacyInlayFilePath(id, ext) {
     const normalizedExt = assertSafeInlayTuple(id, ext);
-    const p = path.join(inlayDir, `${id}.${normalizedExt}`);
+    const filename = `${id}.${normalizedExt}`;
+    if (process.platform === 'win32' && !isPortableWindowsFileName(filename)) return null;
+    const p = path.join(inlayDir, filename);
     assertInsideInlayDir(p);
     return p;
 }
 
 function getLegacyInlaySidecarPath(id) {
     assertSafeInlayTuple(id);
-    const p = path.join(inlayDir, `${id}.meta.json`);
+    const filename = `${id}.meta.json`;
+    if (process.platform === 'win32' && !isPortableWindowsFileName(filename)) return null;
+    const p = path.join(inlayDir, filename);
     assertInsideInlayDir(p);
     return p;
 }
@@ -4299,6 +4324,7 @@ function readSidecarFileStateSync(filePath, id) {
 
 async function readLegacyInlaySidecarState(id, seen = new Set()) {
     const filePath = getLegacyInlaySidecarPath(id);
+    if (!filePath) return { exists: false, info: null, filePath: null };
     const own = await readSidecarFileState(filePath, id);
     if (!own.exists || seen.has(id)) return own;
     const claimantId = `${id}.meta`;
@@ -4315,6 +4341,7 @@ async function readLegacyInlaySidecarState(id, seen = new Set()) {
 
 function readLegacyInlaySidecarStateSync(id, seen = new Set()) {
     const filePath = getLegacyInlaySidecarPath(id);
+    if (!filePath) return { exists: false, info: null, filePath: null };
     const own = readSidecarFileStateSync(filePath, id);
     if (!own.exists || seen.has(id)) return own;
     const claimantId = `${id}.meta`;
@@ -4468,6 +4495,7 @@ async function listCanonicalInlaySidecars() {
 async function legacyPayloadCandidateFromInfo(id, info) {
     if (!info) return null;
     const filePath = getLegacyInlayFilePath(id, info.ext);
+    if (!filePath) return null;
     if (filePath === getLegacyInlaySidecarPath(id)
         || !await exactRegularFileExists(filePath)) return null;
     if (path.basename(filePath).endsWith('.meta.json')) {
@@ -4483,6 +4511,7 @@ async function legacyPayloadCandidateFromInfo(id, info) {
 function legacyPayloadCandidateFromInfoSync(id, info) {
     if (!info) return null;
     const filePath = getLegacyInlayFilePath(id, info.ext);
+    if (!filePath) return null;
     if (filePath === getLegacyInlaySidecarPath(id)
         || !exactRegularFileExistsSync(filePath)) return null;
     if (path.basename(filePath).endsWith('.meta.json')) {
@@ -4654,7 +4683,7 @@ async function writeInlaySidecar(id, info) {
     try {
         await writeDurableInlayTempFile(temporaryPath, inlaySidecarValue(id, normalizedInfo));
         const destinationPath = getInlaySidecarPath(id);
-        await fs.rename(temporaryPath, destinationPath);
+        await renamePublishedFile(temporaryPath, destinationPath);
         await fsyncDirectoryPath(path.dirname(destinationPath));
         const legacy = await readLegacyInlaySidecarState(id);
         if (legacy.info) {
@@ -4684,7 +4713,7 @@ function writeInlaySidecarSync(id, info) {
     try {
         writeDurableInlayTempFileSync(temporaryPath, inlaySidecarValue(id, normalizedInfo));
         const destinationPath = getInlaySidecarPath(id);
-        renameSync(temporaryPath, destinationPath);
+        renamePublishedFileSync(temporaryPath, destinationPath);
         fsyncDirectoryPathSync(path.dirname(destinationPath));
         const legacy = readLegacyInlaySidecarStateSync(id);
         if (legacy.info) {
@@ -4779,12 +4808,12 @@ async function writeInlayFile(id, ext, buffer, info = null) {
         // Publish the payload first while the prior sidecar and prior-extension
         // payload remain authoritative. The sidecar rename below is the commit
         // point for extension-changing replacements.
-        await fs.rename(payloadTemporaryPath, destinationPath);
+        await renamePublishedFile(payloadTemporaryPath, destinationPath);
         payloadPublished = true;
         await fsyncDirectoryPath(path.dirname(destinationPath));
         await reachInlayPublishTestBoundary('after-payload-publish', id);
 
-        await fs.rename(sidecarTemporaryPath, sidecarPath);
+        await renamePublishedFile(sidecarTemporaryPath, sidecarPath);
         sidecarPublished = true;
         await fsyncDirectoryPath(path.dirname(sidecarPath));
 
@@ -4841,11 +4870,11 @@ async function writeInlayFileFromFile(id, ext, sourcePath, info = null) {
         await copyDurableInlayTempFile(sourcePath, payloadTemporaryPath);
         await writeDurableInlayTempFile(sidecarTemporaryPath, sidecarValue);
         await reachInlayPublishTestBoundary('before-payload-publish', id);
-        await fs.rename(payloadTemporaryPath, destinationPath);
+        await renamePublishedFile(payloadTemporaryPath, destinationPath);
         payloadPublished = true;
         await fsyncDirectoryPath(path.dirname(destinationPath));
         await reachInlayPublishTestBoundary('after-payload-publish', id);
-        await fs.rename(sidecarTemporaryPath, sidecarPath);
+        await renamePublishedFile(sidecarTemporaryPath, sidecarPath);
         sidecarPublished = true;
         await fsyncDirectoryPath(path.dirname(sidecarPath));
         try {
@@ -4893,10 +4922,10 @@ function writeInlayFileSync(id, ext, buffer, info = null) {
     try {
         writeDurableInlayTempFileSync(payloadTemporaryPath, Buffer.from(buffer));
         writeDurableInlayTempFileSync(sidecarTemporaryPath, sidecarValue);
-        renameSync(payloadTemporaryPath, destinationPath);
+        renamePublishedFileSync(payloadTemporaryPath, destinationPath);
         payloadPublished = true;
         fsyncDirectoryPathSync(path.dirname(destinationPath));
-        renameSync(sidecarTemporaryPath, sidecarPath);
+        renamePublishedFileSync(sidecarTemporaryPath, sidecarPath);
         sidecarPublished = true;
         fsyncDirectoryPathSync(path.dirname(sidecarPath));
         try {
@@ -11384,6 +11413,7 @@ async function startServer() {
                 console.log(`[Server] http://${host || 'localhost'}:${port}/`);
             });
         }
+        activeServer = server;
     } catch (error) {
         if (!logPluginStorageValidationFailure(
             '[PluginStorage] Rejected invalid row during startup',
@@ -11396,26 +11426,34 @@ async function startServer() {
 }
 
 // Graceful shutdown: flush pending patches and checkpoint WAL before exit
-for (const sig of ['SIGTERM', 'SIGINT']) {
-    process.on(sig, async () => {
-        console.log(`[Server] Received ${sig}, flushing pending data...`);
-        try {
-            const persisted = await queueStorageMutation(
-                () => flushPendingDb({ scheduleSnapshot: false }),
-            );
-            if (persisted) await createBackupAndRotate();
-        } catch (e) { logger.error('[Server] Flush error:', e); }
-        try {
-            await runTrackedWalCheckpointWithBusyRetry('TRUNCATE', 'graceful-shutdown');
-        } catch { /* non-fatal */ }
-        if (sig === 'SIGTERM' && STORAGE_QUEUE_DIAG_ENABLED) {
-            logStorageQueueDiagSummary();
-        }
-        try { modelJobs.close(); } catch (e) { logger.error('[ModelJobs] Close error:', e); }
-        try { requestLogs.close(); } catch (e) { logger.error('[RequestLogs] Close error:', e); }
-        process.exit(0);
-    });
-}
+let activeServer = null;
+installGracefulShutdownHandlers(process, async (sig) => {
+    console.log(`[Server] Received ${sig}, flushing pending data...`);
+    try { activeServer?.close(); } catch (e) { logger.error('[Server] Close error:', e); }
+    try {
+        const persisted = await queueStorageMutation(
+            () => flushPendingDb({ scheduleSnapshot: false }),
+        );
+        if (persisted) await createBackupAndRotate();
+    } catch (e) { logger.error('[Server] Flush error:', e); }
+    try {
+        await runTrackedWalCheckpointWithBusyRetry('TRUNCATE', 'graceful-shutdown');
+    } catch { /* non-fatal */ }
+    if (sig === 'SIGTERM' && STORAGE_QUEUE_DIAG_ENABLED) {
+        logStorageQueueDiagSummary();
+    }
+    try { chatBackupStore.close(); } catch (e) { logger.error('[ChatBackups] Close error:', e); }
+    try { modelJobs.close(); } catch (e) { logger.error('[ModelJobs] Close error:', e); }
+    try { requestLogs.close(); } catch (e) { logger.error('[RequestLogs] Close error:', e); }
+    releaseDatabaseSpoolSync();
+    process.exit(0);
+}, {
+    onError(error, sig) {
+        logger.error(`[Server] ${sig} shutdown failed:`, error);
+        releaseDatabaseSpoolSync();
+        process.exit(1);
+    },
+});
 
 (async () => {
     try { kvCleanupOldDeletions(); }

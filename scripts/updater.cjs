@@ -11,7 +11,7 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const {
     RECOVERY_PATH_STATE_HANDOFF_NAME,
     acquireRecoveryPathStateLockSync,
@@ -27,6 +27,40 @@ const isWin = process.platform === 'win32';
 const REQUIRED_ENTRIES = ['dist', 'server', 'package.json'];
 const REQUIRED_DIST_FILES = ['index.html'];
 const REQUIRED_WIN_ENTRIES = ['bin'];
+
+function quotePowerShellLiteral(value) {
+    return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function extractPortableArchiveSync(archivePath, destinationPath, format) {
+    const commandOptions = { stdio: 'inherit', timeout: 300_000, windowsHide: true };
+    if (isWin && format === 'zip') {
+        try {
+            execFileSync('tar.exe', ['-xf', archivePath, '-C', destinationPath], commandOptions);
+            return;
+        } catch {
+            const script = [
+                "$ErrorActionPreference = 'Stop'",
+                `Expand-Archive -Force -LiteralPath ${quotePowerShellLiteral(archivePath)} `
+                    + `-DestinationPath ${quotePowerShellLiteral(destinationPath)}`,
+            ].join('; ');
+            execFileSync('powershell.exe', [
+                '-NoLogo',
+                '-NoProfile',
+                '-NonInteractive',
+                '-EncodedCommand',
+                Buffer.from(script, 'utf16le').toString('base64'),
+            ], commandOptions);
+            return;
+        }
+    }
+    execFileSync('tar', [
+        format === 'zip' ? '-xf' : '-xzf',
+        archivePath,
+        '-C',
+        destinationPath,
+    ], commandOptions);
+}
 
 function log(msg) { process.stdout.write(`[updater] ${msg}\n`); }
 function error(msg) { process.stderr.write(`[ERROR] ${msg}\n`); process.exit(1); }
@@ -287,11 +321,11 @@ async function main() {
     log('Extracting...');
     const extractedPath = path.join(tmpDir, 'extracted');
     fs.mkdirSync(extractedPath, { recursive: true });
-    if (asset.name.endsWith('.zip')) {
-        execSync(`powershell -Command "Expand-Archive -Path '${downloadPath}' -DestinationPath '${extractedPath}' -Force"`, { stdio: 'inherit' });
-    } else {
-        execSync(`tar -xzf "${downloadPath}" -C "${extractedPath}"`, { stdio: 'inherit' });
-    }
+    extractPortableArchiveSync(
+        downloadPath,
+        extractedPath,
+        asset.name.endsWith('.zip') ? 'zip' : 'tar.gz',
+    );
 
     const extractedDir = path.join(tmpDir, 'extracted');
     const extractedRoot = resolveExtractedRoot(extractedDir);

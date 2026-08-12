@@ -62,3 +62,42 @@ jobs:
           path: reports/
           retention-days: 30
           if-no-files-found: ignore
+
+  windows-storage:
+    name: Windows storage smoke
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Windows filesystem unit coverage
+        run: >
+          pnpm vitest run --config vitest.config.server.ts
+          server/node/runtime/platformFilesystem.test.ts
+          server/node/runtime/portablePath.test.ts
+          server/node/runtime/gracefulShutdown.test.ts
+          server/node/runtime/archiveExtraction.test.ts
+          server/node/runtime/selfUpdateWindows.test.ts
+          server/node/backup/windowsRuntimeSpool.test.ts
+          server/node/backup/importSpool.test.ts
+          server/node/backup/importJournal.test.ts
+
+      - name: Compile-check the Windows launcher
+        shell: bash
+        run: gcc -municode -Wall -Wextra -fsyntax-only scripts/portable/launcher.c
+
+      - name: Run native Windows server smoke
+        run: pnpm vitest run --config vitest.config.windows.ts
