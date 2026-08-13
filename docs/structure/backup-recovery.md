@@ -14,10 +14,10 @@ These mechanisms are intentionally different:
 
 | Mechanism | Scope and policy |
 |---|---|
-| Downloaded full backup | Node self-contained archive; requires valid live DB and every referenced chat |
+| Downloaded full backup | Node self-contained archive; requires a valid live DB, preserves bare stubs for missing chat rows, and reports skipped referenced payloads in response headers |
 | Main-target downgrade export | Non-destructive migration archive for the PocketRisu `main` rollback target; folds chats and plugin storage while retaining main-readable assets and inlays |
 | Upstream-target export | Migration archive; folds/filters PocketRisu state and intentionally omits inlays |
-| Server-file backup | Same strict full-state cut, published atomically into the configured backup directory |
+| Server-file backup | Same point-in-time cut and missing-row warning policy, published atomically into the configured backup directory |
 | Partial export job | Selected characters/personas/modules and referenced identity assets; recovery-oriented missing-chat policy |
 | Automatic snapshot | DB recovery point stored under `database/dbbackup-*`; preserves a bare missing-chat stub with warning |
 | Save-folder import | Destructive replacement from a staged directory or ZIP |
@@ -52,7 +52,7 @@ is assembled at export boundaries by joining the external rows.
 
 ## Full and server-file exports
 
-Full download and server-file export share a strict point-in-time protocol:
+Full download and server-file export share a point-in-time protocol:
 
 1. Wait for any destructive import to finish and enter the storage read queue.
 2. Require a present, positive-size, structurally valid live `database/database.bin`.
@@ -66,14 +66,18 @@ Full download and server-file export share a strict point-in-time protocol:
 7. Release readers, reservations, and private files in `finally`, including disconnect
    and sink-failure paths.
 
-Missing referenced chat rows fail full and server-file exports with
-`BACKUP_MISSING_CHAT_ROW`. This fail-closed policy is different from partial jobs and
-automatic snapshots, which exist to retain a recovery point from already-damaged state.
-Complete remembered-tool markers are also resolved against the pinned
-`cache/mcp-tool-calls/` namespace. Node-only downloads, server-file archives, and
-partial archives emit only referenced canonical rows and fail with
-`BACKUP_MISSING_MCP_TOOL_CALL_ROW` when a marker's payload is absent. Upstream-target
-exports omit this PocketRisu-only namespace.
+Missing referenced chat rows do not reject full or server-file exports. The assembler
+preserves each metadata-only stub, logs every missing `chaId/chatId`, and reports bounded
+details to the caller through full-download response headers or the server-save terminal
+NDJSON event. The encoder-level default remains fail-closed for callers that do not opt
+into this recovery policy.
+
+Complete remembered-tool markers are resolved against the pinned
+`cache/mcp-tool-calls/` namespace. Node-only downloads, server-file archives, and partial
+archives emit only referenced canonical rows; when a referenced payload row is absent,
+they skip it, log it, and report a bounded count/list warning. The shared selector still
+defaults to `BACKUP_MISSING_MCP_TOOL_CALL_ROW` for callers that do not supply the
+skip-and-warn callback. Upstream-target exports omit this PocketRisu-only namespace.
 
 Node-only downloads, server-file archives, and partial archives also select
 composer rows under `drafts/` from the pinned SQLite view. Export selection is
@@ -98,8 +102,9 @@ backups.
 
 `target=main` is the supported non-destructive path for rolling a `serve` installation
 back to the audited PocketRisu `main` storage contract. It uses the same pinned full-state
-cut as an ordinary full export, requires every referenced chat row, folds chat bodies and
-the selected optimized plugin publication into `database.risudat`, and emits the legacy
+cut as an ordinary full export, preserves and reports bare stubs for missing referenced
+chat rows, folds available chat bodies and the selected optimized plugin publication into
+`database.risudat`, and emits the legacy
 version-7 database header accepted by `main`. Ordinary assets, cold storage, inlay
 payloads, inlay sidecars, and inlay metadata remain archive entries because `main`
 understands those names.
@@ -130,8 +135,10 @@ Partial export is a server job, not a browser-memory serializer:
    repeated cleanup safe; jobs also expire by TTL.
 
 There is one active partial job per session. A missing referenced chat row is preserved
-as a bare stub with a warning. Sink construction or write failure must cancel both the
-response body and browser sink so the server can release the pin.
+as a bare stub with a warning. A missing referenced remembered MCP payload is skipped,
+recorded on the job, and exposed through the download warning headers. Sink construction
+or write failure must cancel both the response body and browser sink so the server can
+release the pin.
 
 The current endpoints are the create/status/cancel collection under
 `/api/backup/export/jobs` plus `/:jobId/download`. Calling the old partial scope through
@@ -348,8 +355,9 @@ setting does not create a Docker persistence boundary.
 ## Change map
 
 - Full/server point-in-time export: start at `pinFullBackupState()`,
-  `streamBackupRisuSave.cjs`, filesystem pin/copy helpers, disk reservations, and full
-  export regression suites.
+  `buildSelfContainedBackupDatabase()`, `selectReferencedMcpToolCallEntries()`,
+  `streamBackupRisuSave.cjs`, filesystem pin/copy helpers, disk reservations,
+  `NodeStorage.saveServerBackup()`, `backuplocal.ts`, and full export regression suites.
 - Partial jobs: update preparation/writer code, the `/api/backup/export/jobs` route
   family, `NodeStorage.exportBackup()`, and `backuplocal.ts` together.
 - Archive framing: coordinate `backupEntryFormat.cjs`, shared key policy, import parser,
@@ -371,6 +379,8 @@ Representative guarantees live in:
 
 - `test/compat/full-export-database-source.test.ts`
 - `test/compat/full-export-boundaries.test.ts`
+- `test/compat/backup-snapshot-integrity.test.ts`
+- `test/compat/mcp-tool-call-recovery.test.ts`
 - `test/compat/full-export-import-race.test.ts`
 - `test/compat/full-export-corruption.test.ts`
 - `test/compat/import-ingress-memory.test.ts`

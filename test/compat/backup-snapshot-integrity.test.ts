@@ -2,6 +2,7 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { afterAll, describe, expect, test } from 'vitest'
 import { createClient } from './helpers/client.js'
+import { decodeBackup } from './helpers/decode.js'
 import { decodeRisuDat } from './helpers/normalize.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { Packr } from 'msgpackr'
@@ -47,7 +48,7 @@ async function waitForKvRows(
 }
 
 describe('backup missing chat-row integrity', () => {
-  test('full download and server save both reject a missing authoritative chat row', async () => {
+  test('full download and server save preserve and warn about a missing chat row', async () => {
     const server = await spawnServer()
     servers.push(server)
     const client = await createClient(server.port, server.password)
@@ -78,18 +79,40 @@ describe('backup missing chat-row integrity', () => {
     )
 
     const exportResponse = await client.fetch('/api/backup/export')
-    expect(exportResponse.status).toBe(500)
-    expect(exportResponse.headers.get('content-disposition')).toBeNull()
-    await expect(exportResponse.json()).resolves.toMatchObject({
-      code: 'BACKUP_MISSING_CHAT_ROW',
-      error: expect.stringContaining(`${chaId}/${chatId}`),
-    })
+    expect(exportResponse.status).toBe(200)
+    expect(exportResponse.headers.get('content-disposition')).toContain('attachment;')
+    expect(exportResponse.headers.get('x-risu-backup-missing-chats')).toBe('1')
+    expect(exportResponse.headers.get('x-risu-backup-missing-chat-list'))
+      .toBe(`${chaId}%2F${chatId}`)
+    const exportEntries = decodeBackup(Buffer.from(await exportResponse.arrayBuffer()))
+    const exportDatabase = decodeRisuDat(
+      exportEntries.find(entry => entry.name === 'database.risudat')!.data,
+    ) as Record<string, any>
+    expect(exportDatabase.characters[0].chats[0]).toEqual(
+      expect.objectContaining({ id: chatId, _stub: true }),
+    )
+    expect(exportDatabase.characters[0].chats[0]).not.toHaveProperty('message')
 
     const serverSaveResponse = await client.fetch('/api/backup/server/save', { method: 'POST' })
-    expect(serverSaveResponse.status).toBe(500)
-    await expect(serverSaveResponse.json()).resolves.toMatchObject({
-      code: 'BACKUP_MISSING_CHAT_ROW',
-      error: expect.stringContaining(`${chaId}/${chatId}`),
+    expect(serverSaveResponse.status).toBe(200)
+    const events = (await serverSaveResponse.text()).trim().split('\n').map(line => JSON.parse(line))
+    const done = events.find(event => event.type === 'done')
+    expect(done).toMatchObject({
+      ok: true,
+      missingChats: 1,
+      missingChatList: [`${chaId}/${chatId}`],
+      missingMcpToolCalls: 0,
+      missingMcpToolCallList: [],
     })
+    const savedResponse = await client.fetch(`/api/backup/server/download/${done.filename}`)
+    expect(savedResponse.status).toBe(200)
+    const savedEntries = decodeBackup(Buffer.from(await savedResponse.arrayBuffer()))
+    const savedDatabase = decodeRisuDat(
+      savedEntries.find(entry => entry.name === 'database.risudat')!.data,
+    ) as Record<string, any>
+    expect(savedDatabase.characters[0].chats[0]).toEqual(
+      expect.objectContaining({ id: chatId, _stub: true }),
+    )
+    expect(savedDatabase.characters[0].chats[0]).not.toHaveProperty('message')
   })
 })

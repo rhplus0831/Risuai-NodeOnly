@@ -144,11 +144,11 @@ bridge and permissioned host APIs. See
 
 ### Export, import, and recover
 
-Full/server exports require a valid live database and every referenced chat, then bind a
-pinned WAL view to verified private filesystem copies. Partial exports and automatic
-snapshots have explicit recovery-oriented missing-chat policies. Destructive imports and
-restores stage bounded input behind the import barrier and report committed,
-not-committed, or unknown outcomes. See
+Full/server exports require a valid live database, then bind a pinned WAL view to verified
+private filesystem copies. A missing referenced chat row is preserved as a bare stub and
+reported as a warning instead of rejecting the archive. Destructive imports and restores
+stage bounded input behind the import barrier and report committed, not-committed, or
+unknown outcomes. See
 [backup and recovery](docs/structure/backup-recovery.md).
 
 ## Vocabulary that prevents expensive mistakes
@@ -212,9 +212,9 @@ not-committed, or unknown outcomes. See
 
 ### Backup, import, and compatibility
 
-- Full and server-file exports require a valid live database and all referenced chats.
-  Automatic snapshots and partial jobs deliberately preserve a bare stub for an already
-  missing chat so damaged state still has a recovery point.
+- Full and server-file exports require a valid live database. Missing referenced chat rows
+  are preserved as bare stubs and reported as warnings, matching the recovery-oriented
+  policy used by automatic snapshots and partial jobs.
 - Full exports combine one pinned SQLite view with verified private filesystem copies.
   Database assembly uses `POCKETRISU_SPOOL_DIR` or `save/.spool`; filesystem pins remain
   under `save/.partial-export-spool`.

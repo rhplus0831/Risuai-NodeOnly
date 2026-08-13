@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
     notifySuccess: vi.fn(),
     waitAlert: vi.fn(),
     exportBackup: vi.fn(),
+    saveServerBackup: vi.fn(),
     uploadSaveFolderZip: vi.fn(),
     downloadFile: vi.fn(),
     createWriteStream: vi.fn(),
@@ -35,6 +36,7 @@ vi.mock('../globalApi.svelte', () => ({
     downloadFile: mocks.downloadFile,
     forageStorage: {
         exportBackup: mocks.exportBackup,
+        saveServerBackup: mocks.saveServerBackup,
         uploadSaveFolderZip: mocks.uploadSaveFolderZip,
     },
 }))
@@ -49,6 +51,8 @@ vi.mock('src/lang', () => ({
         importSaveFolderCommittedFailure: 'save-folder import committed with an error',
         importSaveFolderOutcomeUnknown: 'save-folder import outcome unknown',
         importSaveFolderFailure: 'save-folder import not committed',
+        serverBackupSaving: 'Saving server backup',
+        serverBackupSaveSuccess: (filename: string, size: string) => `Backup saved: ${filename} (${size})`,
     },
 }))
 
@@ -58,18 +62,22 @@ vi.mock('streamsaver', () => ({
 
 const {
     ImportFromSaveZip,
+    SaveLocalBackup,
+    SaveLocalBackupForUpstream,
     SaveLocalBackupForMain,
     SavePartialLocalBackup,
+    SaveServerBackup,
     runSaveFolderZipImport,
 } = await import('./backuplocal')
 
-function backupResponse(missingAssets = 0) {
+function backupResponse(missingAssets = 0, warningHeaders: Record<string, string> = {}) {
     const bytes = new Uint8Array([1, 2, 3, 4])
     return {
         body: null,
         headers: new Headers({
             'content-disposition': 'attachment; filename="server-partial.bin"',
             'x-risu-backup-missing-assets': String(missingAssets),
+            ...warningHeaders,
         }),
         arrayBuffer: async () => bytes.buffer,
     } as Response
@@ -79,6 +87,15 @@ beforeEach(() => {
     vi.clearAllMocks()
     mocks.alertConfirm.mockResolvedValue(true)
     mocks.exportBackup.mockResolvedValue(backupResponse())
+    mocks.saveServerBackup.mockResolvedValue({
+        ok: true,
+        filename: 'server-backup.bin',
+        size: 2048,
+        missingChats: 0,
+        missingChatList: [],
+        missingMcpToolCalls: 0,
+        missingMcpToolCallList: [],
+    })
     mocks.uploadSaveFolderZip.mockResolvedValue({ ok: true, imported: 7 })
     mocks.downloadFile.mockResolvedValue(undefined)
     mocks.createWriteStream.mockReset()
@@ -273,6 +290,19 @@ describe('SavePartialLocalBackup', () => {
         expect(mocks.notifySuccess).not.toHaveBeenCalled()
     })
 
+    test('reports missing remembered MCP payloads alongside missing profile assets', async () => {
+        mocks.exportBackup.mockResolvedValue(backupResponse(2, {
+            'x-risu-backup-missing-mcp-tool-calls': '1',
+            'x-risu-backup-missing-mcp-tool-call-list': 'call-partial-missing',
+        }))
+
+        await SavePartialLocalBackup()
+
+        expect(mocks.alertMd).toHaveBeenCalledWith(expect.stringContaining('2 referenced profile image'))
+        expect(mocks.alertMd).toHaveBeenCalledWith(expect.stringContaining('call-partial-missing'))
+        expect(mocks.notifySuccess).not.toHaveBeenCalled()
+    })
+
     test('does not contact the server when either confirmation is declined', async () => {
         mocks.alertConfirm.mockResolvedValueOnce(true).mockResolvedValueOnce(false)
         await SavePartialLocalBackup()
@@ -427,6 +457,59 @@ describe('SavePartialLocalBackup', () => {
         expect(writable.locked).toBe(false)
         expect(mocks.notifySuccess).toHaveBeenCalledWith('Success')
         expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+})
+
+describe('full backup missing-row warnings', () => {
+    test.each([
+        ['node-only', SaveLocalBackup, undefined],
+        ['upstream', SaveLocalBackupForUpstream, { target: 'upstream' }],
+        ['main', SaveLocalBackupForMain, { target: 'main' }],
+    ] as const)('shows the bounded warning details after a successful %s download', async (
+        _label,
+        save,
+        expectedOptions,
+    ) => {
+        mocks.exportBackup.mockResolvedValue(backupResponse(0, {
+            'x-risu-backup-missing-chats': '1',
+            'x-risu-backup-missing-chat-list': 'character-id%2Fchat-id',
+            'x-risu-backup-missing-mcp-tool-calls': '1',
+            'x-risu-backup-missing-mcp-tool-call-list': 'call-full-missing',
+        }))
+
+        await save()
+
+        if (expectedOptions) {
+            expect(mocks.exportBackup).toHaveBeenCalledWith(expectedOptions)
+        } else {
+            expect(mocks.exportBackup).toHaveBeenCalledWith()
+        }
+        expect(mocks.alertMd).toHaveBeenCalledWith(expect.stringContaining('character-id/chat-id'))
+        expect(mocks.alertMd).toHaveBeenCalledWith(expect.stringContaining('call-full-missing'))
+        expect(mocks.notifySuccess).not.toHaveBeenCalled()
+    })
+})
+
+describe('SaveServerBackup', () => {
+    test('includes filename and size in the missing-row warning', async () => {
+        mocks.saveServerBackup.mockResolvedValue({
+            ok: true,
+            filename: 'risu-backup-warning.bin',
+            size: 2048,
+            missingChats: 1,
+            missingChatList: ['character-id/chat-id'],
+            missingMcpToolCalls: 1,
+            missingMcpToolCallList: ['call-server-missing'],
+        })
+
+        await SaveServerBackup()
+
+        expect(mocks.alertMd).toHaveBeenCalledWith(expect.stringContaining(
+            'Backup saved: risu-backup-warning.bin (2.0 KB)',
+        ))
+        expect(mocks.alertMd).toHaveBeenCalledWith(expect.stringContaining('character-id/chat-id'))
+        expect(mocks.alertMd).toHaveBeenCalledWith(expect.stringContaining('call-server-missing'))
+        expect(mocks.notifySuccess).not.toHaveBeenCalled()
     })
 })
 

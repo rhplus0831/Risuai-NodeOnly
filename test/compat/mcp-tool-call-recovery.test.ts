@@ -122,7 +122,10 @@ async function waitForNewSnapshot(
   throw new Error('Timed out waiting for an MCP recovery snapshot')
 }
 
-async function createPartialBackup(client: RisuClient): Promise<Buffer> {
+async function createPartialBackup(client: RisuClient): Promise<{
+  archive: Buffer
+  headers: Headers
+}> {
   const jobId = randomUUID()
   const create = await client.fetch('/api/backup/export/jobs', {
     method: 'POST',
@@ -138,7 +141,10 @@ async function createPartialBackup(client: RisuClient): Promise<Buffer> {
     if (status.state === 'ready') {
       const download = await client.fetch(`/api/backup/export/jobs/${jobId}/download`)
       expect(download.status).toBe(200)
-      return Buffer.from(await download.arrayBuffer())
+      return {
+        archive: Buffer.from(await download.arrayBuffer()),
+        headers: download.headers,
+      }
     }
     if (status.state === 'failed' || status.state === 'cancelled') {
       throw new Error(status.error ?? `Partial backup ${status.state}`)
@@ -179,8 +185,9 @@ describe('remembered MCP tool-call recovery', () => {
     expect(JSON.parse(savedEntries.get(mcpStorageKey(callId))!.toString('utf8'))).toEqual(payload(callId))
     expect(savedEntries.has(mcpStorageKey(unreferencedId))).toBe(false)
 
+    const partialBackup = await createPartialBackup(sourceClient)
     const partialEntries = new Map(
-      decodeBackup(await createPartialBackup(sourceClient)).map(entry => [entry.name, entry.data]),
+      decodeBackup(partialBackup.archive).map(entry => [entry.name, entry.data]),
     )
     expect(JSON.parse(partialEntries.get(mcpStorageKey(callId))!.toString('utf8'))).toEqual(payload(callId))
     expect(partialEntries.has(mcpStorageKey(unreferencedId))).toBe(false)
@@ -212,7 +219,7 @@ describe('remembered MCP tool-call recovery', () => {
       .toEqual(payload(callId))
   })
 
-  test('strict full export rejects a remembered marker whose payload row is missing', async () => {
+  test('backup exports skip and warn about a remembered marker whose payload row is missing', async () => {
     const callId = 'call-missing-1'
     const server = await spawnServer()
     servers.push(server)
@@ -220,11 +227,33 @@ describe('remembered MCP tool-call recovery', () => {
 
     expect((await client.importBackup(recoverySeed({ callId, includePayload: false }))).ok).toBe(true)
     const response = await client.fetch('/api/backup/export')
-    expect(response.status).toBe(500)
-    await expect(response.json()).resolves.toMatchObject({
-      code: 'BACKUP_MISSING_MCP_TOOL_CALL_ROW',
-      error: expect.stringContaining(callId),
+    expect(response.status).toBe(200)
+    expect(response.headers.get('x-risu-backup-missing-mcp-tool-calls')).toBe('1')
+    expect(response.headers.get('x-risu-backup-missing-mcp-tool-call-list')).toBe(callId)
+    const exportEntries = decodeBackup(Buffer.from(await response.arrayBuffer()))
+    expect(exportEntries.some(entry => entry.name === mcpStorageKey(callId))).toBe(false)
+
+    const serverSave = await client.fetch('/api/backup/server/save', { method: 'POST' })
+    expect(serverSave.status).toBe(200)
+    const events = (await serverSave.text()).trim().split('\n').map(line => JSON.parse(line))
+    const done = events.find(event => event.type === 'done')
+    expect(done).toMatchObject({
+      ok: true,
+      missingChats: 0,
+      missingChatList: [],
+      missingMcpToolCalls: 1,
+      missingMcpToolCallList: [callId],
     })
+    const savedDownload = await client.fetch(`/api/backup/server/download/${done.filename}`)
+    expect(savedDownload.status).toBe(200)
+    const savedEntries = decodeBackup(Buffer.from(await savedDownload.arrayBuffer()))
+    expect(savedEntries.some(entry => entry.name === mcpStorageKey(callId))).toBe(false)
+
+    const partial = await createPartialBackup(client)
+    expect(partial.headers.get('x-risu-backup-missing-mcp-tool-calls')).toBe('1')
+    expect(partial.headers.get('x-risu-backup-missing-mcp-tool-call-list')).toBe(callId)
+    const partialEntries = decodeBackup(partial.archive)
+    expect(partialEntries.some(entry => entry.name === mcpStorageKey(callId))).toBe(false)
   })
 
   test('automatic snapshot folds and atomically restores referenced payloads', async () => {

@@ -1139,6 +1139,71 @@ function warnAndPreserveMissingChatRow(source, chaId, chatId) {
     );
 }
 
+function warnAndSkipMissingMcpToolCallRow(source, callId) {
+    logger.warn(
+        `[${source}] Missing referenced remembered MCP tool-call row ${callId}; skipping payload`
+    );
+}
+
+const BACKUP_MISSING_ROW_DETAIL_LIMIT = 20;
+const BACKUP_MISSING_ROW_DETAIL_HEADER_MAX_CHARS = 2 * 1024;
+
+function encodeBackupMissingRowDetail(value) {
+    return encodeURIComponent(String(value).replace(/[\uD800-\uDFFF]/g, '\uFFFD'));
+}
+
+function appendBackupMissingRowDetail(list, value) {
+    if (list.length >= BACKUP_MISSING_ROW_DETAIL_LIMIT) return;
+    const detail = String(value).replace(/[\uD800-\uDFFF]/g, '\uFFFD');
+    const encodedLength = encodeBackupMissingRowDetail(detail).length;
+    const currentLength = list.reduce(
+        (sum, entry) => sum + encodeBackupMissingRowDetail(entry).length,
+        Math.max(0, list.length - 1),
+    );
+    if (currentLength + (list.length > 0 ? 1 : 0) + encodedLength
+        > BACKUP_MISSING_ROW_DETAIL_HEADER_MAX_CHARS) return;
+    list.push(detail);
+}
+
+function createBackupMissingRowsCollector(source) {
+    const result = {
+        missingChats: 0,
+        missingChatList: [],
+        missingMcpToolCalls: 0,
+        missingMcpToolCallList: [],
+    };
+    return {
+        result,
+        onMissingChatRow(chaId, chatId) {
+            warnAndPreserveMissingChatRow(source, chaId, chatId);
+            result.missingChats++;
+            appendBackupMissingRowDetail(result.missingChatList, `${chaId}/${chatId}`);
+        },
+        onMissingMcpToolCallRow(callId) {
+            warnAndSkipMissingMcpToolCallRow(source, callId);
+            result.missingMcpToolCalls++;
+            appendBackupMissingRowDetail(result.missingMcpToolCallList, callId);
+        },
+    };
+}
+
+function setBackupMissingRowHeaders(res, missingRows) {
+    res.setHeader('x-risu-backup-missing-chats', missingRows.missingChats);
+    res.setHeader('x-risu-backup-missing-mcp-tool-calls', missingRows.missingMcpToolCalls);
+    if (missingRows.missingChatList.length > 0) {
+        res.setHeader(
+            'x-risu-backup-missing-chat-list',
+            missingRows.missingChatList.map(encodeBackupMissingRowDetail).join(','),
+        );
+    }
+    if (missingRows.missingMcpToolCallList.length > 0) {
+        res.setHeader(
+            'x-risu-backup-missing-mcp-tool-call-list',
+            missingRows.missingMcpToolCallList.map(encodeBackupMissingRowDetail).join(','),
+        );
+    }
+}
+
 async function createBackupAndRotate() {
     const now = Date.now();
     if (dbPersistRetryPending) {
@@ -6377,24 +6442,23 @@ function missingMcpToolCallBackupRowError(callId) {
     return error;
 }
 
-async function selectReferencedMcpToolCallEntries(entries, databaseSpool, shouldAbort) {
+async function selectReferencedMcpToolCallEntries(
+    entries,
+    databaseSpool,
+    shouldAbort,
+    onMissingRow = (callId) => { throw missingMcpToolCallBackupRowError(callId); },
+) {
     const candidates = new Map(
         entries.filter((entry) => entry.mcpToolCall === true)
             .map((entry) => [entry.key, entry]),
     );
-    if (candidates.size === 0) {
-        const referenced = await scanMcpToolCallIdsFromFile(databaseSpool.filePath, { shouldAbort });
-        if (referenced.size > 0) {
-            throw missingMcpToolCallBackupRowError(referenced.values().next().value);
-        }
-        return entries;
-    }
     const referenced = await scanMcpToolCallIdsFromFile(databaseSpool.filePath, { shouldAbort });
     const selectedKeys = new Set();
     for (const callId of referenced) {
         const storageKey = mcpToolCallStorageKey(callId);
         if (!storageKey || !candidates.has(storageKey)) {
-            throw missingMcpToolCallBackupRowError(callId);
+            onMissingRow(callId);
+            continue;
         }
         selectedKeys.add(storageKey);
     }
@@ -7655,6 +7719,11 @@ async function writePartialExportArchive(job, database, entries) {
         entries,
         job.databaseSpool,
         () => job.abortController.signal.aborted,
+        (callId) => {
+            warnAndSkipMissingMcpToolCallRow('Partial Backup Export', callId);
+            job.missingMcpToolCalls++;
+            appendBackupMissingRowDetail(job.missingMcpToolCallList, callId);
+        },
     );
     preflightBackupEntries([
         ...selectedEntries,
@@ -14404,6 +14473,8 @@ app.post('/api/backup/export/jobs', async (req, res, next) => {
             snapshot: null,
             databaseSpool: null,
             missingAssets: 0,
+            missingMcpToolCalls: 0,
+            missingMcpToolCallList: [],
             size: 0,
             error: null,
             cleaned: false,
@@ -14449,6 +14520,7 @@ app.get('/api/backup/export/jobs/:jobId', async (req, res, next) => {
             bytes: job.progress.bytes,
             size: job.state === 'ready' ? job.size : undefined,
             missingAssets: job.missingAssets,
+            missingMcpToolCalls: job.missingMcpToolCalls,
             error: job.state === 'failed' ? job.error : undefined,
         });
     } catch (error) {
@@ -14515,6 +14587,13 @@ app.get('/api/backup/export/jobs/:jobId/download', async (req, res, next) => {
         res.setHeader('content-length', job.size);
         res.setHeader('x-risu-backup-assets', Math.max(0, job.progress.total - 2));
         res.setHeader('x-risu-backup-missing-assets', job.missingAssets);
+        res.setHeader('x-risu-backup-missing-mcp-tool-calls', job.missingMcpToolCalls);
+        if (job.missingMcpToolCallList.length > 0) {
+            res.setHeader(
+                'x-risu-backup-missing-mcp-tool-call-list',
+                job.missingMcpToolCallList.map(encodeBackupMissingRowDetail).join(','),
+            );
+        }
         if (process.env.NODE_ENV === 'test'
             && process.env.POCKETRISU_TEST_PARTIAL_EXPORT_STALL_DOWNLOAD === '1') {
             // Deterministically hold a response after headers and a real
@@ -14572,6 +14651,7 @@ app.get('/api/backup/export', async (req, res, next) => {
     let backupDbSpool = null;
     let pinnedState = null;
     const shouldAbort = () => abortTracker.signal.aborted || res.destroyed;
+    let missingRows;
     try {
         const requestedTarget = req.query.target;
         if (requestedTarget !== undefined
@@ -14590,6 +14670,8 @@ app.get('/api/backup/export', async (req, res, next) => {
         // inlay namespaces that the PocketRisu main importer understands.
         const target = requestedTarget ?? 'nodeonly';
         const foldPluginStorage = target !== 'nodeonly';
+        const missingRowsCollector = createBackupMissingRowsCollector(`Full Export (${target})`);
+        missingRows = missingRowsCollector.result;
         pinnedState = await pinFullBackupState({
             target,
             signal: abortTracker.signal,
@@ -14603,6 +14685,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             databaseSource: pinnedState.databaseSource,
             databaseState: pinnedState.databaseState,
             signal: abortTracker.signal,
+            onMissingChatRow: missingRowsCollector.onMissingChatRow,
         });
         if (target === 'main') {
             await requireMainCompatibleBackupDatabase(backupDbSpool);
@@ -14613,6 +14696,7 @@ app.get('/api/backup/export', async (req, res, next) => {
                 pinnedState.entries,
                 backupDbSpool,
                 shouldAbort,
+                missingRowsCollector.onMissingMcpToolCallRow,
             )
             : pinnedState.entries;
         const dbSize = backupDbSpool?.size ?? 0;
@@ -14630,6 +14714,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         res.setHeader('content-length', totalBytes);
         res.setHeader('x-risu-backup-assets', namespacedEntries.length);
         res.setHeader('x-risu-backup-target', target);
+        setBackupMissingRowHeaders(res, missingRows);
         if (target === 'main') {
             res.setHeader('x-risu-backup-omitted', 'drafts,remembered-mcp-tool-calls');
         }
@@ -14861,6 +14946,8 @@ app.post('/api/backup/server/save', async (req, res, next) => {
     let backupDbSpool = null;
     let pinnedState = null;
     const shouldAbort = () => abortTracker.signal.aborted || res.destroyed;
+    const missingRowsCollector = createBackupMissingRowsCollector('Server Backup');
+    const missingRows = missingRowsCollector.result;
     try {
         pinnedState = await pinFullBackupState({
             target: 'nodeonly',
@@ -14876,6 +14963,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             databaseSource: pinnedState.databaseSource,
             databaseState: pinnedState.databaseState,
             signal: abortTracker.signal,
+            onMissingChatRow: missingRowsCollector.onMissingChatRow,
         });
         throwIfBackupExportAborted(abortTracker.signal);
 
@@ -14883,6 +14971,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             pinnedState.entries,
             backupDbSpool,
             shouldAbort,
+            missingRowsCollector.onMissingMcpToolCallRow,
         );
         preflightBackupEntries([
             ...namespacedEntries,
@@ -15000,7 +15089,16 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             console.log(`[Server Backup] Saved: ${filename} (${(stat.size / 1024 / 1024).toFixed(1)} MB)`);
             if (!await writeWithBackpressure(
                 res,
-                JSON.stringify({ type: 'done', ok: true, filename, size: stat.size }) + '\n',
+                JSON.stringify({
+                    type: 'done',
+                    ok: true,
+                    filename,
+                    size: stat.size,
+                    missingChats: missingRows.missingChats,
+                    missingChatList: missingRows.missingChatList,
+                    missingMcpToolCalls: missingRows.missingMcpToolCalls,
+                    missingMcpToolCallList: missingRows.missingMcpToolCallList,
+                }) + '\n',
                 shouldAbort,
             )) throw new Error('Client disconnected before backup publication acknowledgement');
             res.end();

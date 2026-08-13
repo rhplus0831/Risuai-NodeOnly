@@ -4,7 +4,9 @@ import { readdir } from 'node:fs/promises'
 import Database from 'better-sqlite3'
 import { afterAll, describe, expect, test } from 'vitest'
 import { createClient, type RisuClient } from './helpers/client.js'
+import { decodeBackup } from './helpers/decode.js'
 import { encodeBackup } from './helpers/encode.js'
+import { decodeRisuDat } from './helpers/normalize.js'
 import { createSeedBackup } from './helpers/seed.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 
@@ -79,6 +81,19 @@ function missingChatBlockDatabase(compression: boolean): Buffer {
   ])
 }
 
+function expectMissingChatStub(archive: Buffer): void {
+  const databaseEntry = decodeBackup(archive).find(entry => entry.name === 'database.risudat')
+  expect(databaseEntry).toBeTruthy()
+  const database = decodeRisuDat(databaseEntry!.data) as Record<string, any>
+  const chat = database.characters[0].chats[0]
+  expect(chat).toEqual(expect.objectContaining({
+    id: 'missing-chat',
+    name: 'Missing',
+    _stub: true,
+  }))
+  expect(chat).not.toHaveProperty('message')
+}
+
 async function expectArchiveExportRejected(
   client: RisuClient,
   target: 'nodeonly' | 'upstream' | 'main',
@@ -94,7 +109,7 @@ async function expectArchiveExportRejected(
 
 describe('full export corruption boundaries', () => {
   test.each([false, true])(
-    'raw/gzip block exports reject a referenced missing chat row (gzip=%s)',
+    'raw/gzip block exports preserve and warn about a referenced missing chat row (gzip=%s)',
     async compression => {
       const server = await spawnServer()
       servers.push(server)
@@ -109,14 +124,31 @@ describe('full export corruption boundaries', () => {
         const response = await client.fetch(
           `/api/backup/export${target === 'nodeonly' ? '' : `?target=${target}`}`,
         )
-        expect(response.status).toBe(500)
-        expect(response.headers.get('content-disposition')).toBeNull()
-        expect(response.headers.get('x-risu-backup-assets')).toBeNull()
-        await expect(response.json()).resolves.toMatchObject({
-          code: 'BACKUP_MISSING_CHAT_ROW',
-        })
+        expect(response.status).toBe(200)
+        expect(response.headers.get('content-disposition')).toContain('attachment;')
+        expect(response.headers.get('content-type')).toContain('application/octet-stream')
+        expect(response.headers.get('x-risu-backup-missing-chats')).toBe('1')
+        expect(response.headers.get('x-risu-backup-missing-chat-list'))
+          .toBe('missing-chat-character%2Fmissing-chat')
+        expectMissingChatStub(Buffer.from(await response.arrayBuffer()))
       }
-      expect(await readdir(path.join(server.cwd, 'backups'))).toEqual([])
+
+      const saveResponse = await client.fetch('/api/backup/server/save', { method: 'POST' })
+      expect(saveResponse.status).toBe(200)
+      expect(saveResponse.headers.get('content-type')).toContain('application/x-ndjson')
+      const events = (await saveResponse.text()).trim().split('\n').map(line => JSON.parse(line))
+      const done = events.find(event => event.type === 'done')
+      expect(done).toMatchObject({
+        ok: true,
+        missingChats: 1,
+        missingChatList: ['missing-chat-character/missing-chat'],
+        missingMcpToolCalls: 0,
+        missingMcpToolCallList: [],
+      })
+      const savedResponse = await client.fetch(`/api/backup/server/download/${done.filename}`)
+      expect(savedResponse.status).toBe(200)
+      expectMissingChatStub(Buffer.from(await savedResponse.arrayBuffer()))
+      expect(await readdir(path.join(server.cwd, 'backups'))).toEqual([done.filename])
     },
     30_000,
   )

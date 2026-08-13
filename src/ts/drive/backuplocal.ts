@@ -10,6 +10,78 @@ function formatBytes(bytes: number): string {
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
+interface BackupMissingRows {
+    missingChats: number
+    missingChatList: string[]
+    missingMcpToolCalls: number
+    missingMcpToolCallList: string[]
+}
+
+function readBackupWarningCount(headers: Headers, name: string): number {
+    const value = Number(headers.get(name) ?? '0')
+    return Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0
+}
+
+function readBackupWarningList(headers: Headers, name: string): string[] {
+    const value = headers.get(name)
+    if (!value) return []
+    return value.split(',').slice(0, 20).map((entry) => {
+        try {
+            return decodeURIComponent(entry)
+        } catch {
+            return entry
+        }
+    })
+}
+
+function readBackupMissingRows(response: Response): BackupMissingRows {
+    return {
+        missingChats: readBackupWarningCount(response.headers, 'x-risu-backup-missing-chats'),
+        missingChatList: readBackupWarningList(response.headers, 'x-risu-backup-missing-chat-list'),
+        missingMcpToolCalls: readBackupWarningCount(
+            response.headers,
+            'x-risu-backup-missing-mcp-tool-calls',
+        ),
+        missingMcpToolCallList: readBackupWarningList(
+            response.headers,
+            'x-risu-backup-missing-mcp-tool-call-list',
+        ),
+    }
+}
+
+function markdownCode(value: string): string {
+    return `\`${value.replace(/[\\`]/g, '\\$&')}\``
+}
+
+function formatMissingDetail(list: string[], count: number): string {
+    if (list.length === 0) return ''
+    const remaining = Math.max(0, count - list.length)
+    return `: ${list.map(markdownCode).join(', ')}${remaining > 0 ? `, and ${remaining} more` : ''}`
+}
+
+function missingRowWarningItems(missing: BackupMissingRows): string[] {
+    const items: string[] = []
+    if (missing.missingChats > 0) {
+        items.push(
+            `${missing.missingChats} referenced chat row(s) were missing; metadata-only stubs were preserved`
+            + `${formatMissingDetail(missing.missingChatList, missing.missingChats)}.`,
+        )
+    }
+    if (missing.missingMcpToolCalls > 0) {
+        items.push(
+            `${missing.missingMcpToolCalls} referenced remembered MCP tool-call payload(s) were missing and skipped`
+            + `${formatMissingDetail(missing.missingMcpToolCallList, missing.missingMcpToolCalls)}.`,
+        )
+    }
+    return items
+}
+
+function showBackupWarning(successMessage: string, items: string[]): boolean {
+    if (items.length === 0) return false
+    alertMd(`${successMessage}\n\nWarning:\n\n- ${items.join('\n- ')}`)
+    return true
+}
+
 function throwIfBackupAborted(signal?: AbortSignal | null) {
     if (!signal?.aborted) return
     throw signal.reason instanceof Error
@@ -98,8 +170,11 @@ export async function SaveLocalBackup(){
     try {
         alertWait("Saving local backup...")
         const response = await forageStorage.exportBackup()
+        const missingRows = readBackupMissingRows(response)
         await streamBackupToDisk(response, `risu-backup-${Date.now()}.bin`)
-        notifySuccess('Success')
+        if (!showBackupWarning('Backup successful.', missingRowWarningItems(missingRows))) {
+            notifySuccess('Success')
+        }
     } catch (error) {
         console.error(error)
         alertError('Failed')
@@ -110,8 +185,11 @@ export async function SaveLocalBackupForUpstream(){
     try {
         alertWait("Saving local backup...")
         const response = await forageStorage.exportBackup({ target: 'upstream' })
+        const missingRows = readBackupMissingRows(response)
         await streamBackupToDisk(response, `risu-backup-${Date.now()}-upstream.bin`)
-        notifySuccess('Success')
+        if (!showBackupWarning('Backup successful.', missingRowWarningItems(missingRows))) {
+            notifySuccess('Success')
+        }
     } catch (error) {
         console.error(error)
         alertError('Failed')
@@ -122,8 +200,11 @@ export async function SaveLocalBackupForMain(){
     try {
         alertWait("Preparing a main-compatible rollback export...")
         const response = await forageStorage.exportBackup({ target: 'main' })
+        const missingRows = readBackupMissingRows(response)
         await streamBackupToDisk(response, `risu-backup-${Date.now()}-main.bin`)
-        notifySuccess('Success')
+        if (!showBackupWarning('Backup successful.', missingRowWarningItems(missingRows))) {
+            notifySuccess('Success')
+        }
     } catch (error) {
         console.error(error)
         alertError(error instanceof Error ? error.message : 'Failed')
@@ -176,10 +257,13 @@ export async function SavePartialLocalBackup(signal?: AbortSignal | null){
             },
         })
         const missingAssets = Number(response.headers.get('x-risu-backup-missing-assets') ?? '0')
+        const missingRows = readBackupMissingRows(response)
         await streamBackupToDisk(response, `risu-backup-${Date.now()}-partial.bin`, activeSignal)
+        const warnings = missingRowWarningItems(missingRows)
         if (Number.isFinite(missingAssets) && missingAssets > 0) {
-            alertMd(`Partial backup successful, but ${missingAssets} referenced profile image(s) were missing and skipped.`)
-        } else {
+            warnings.unshift(`${missingAssets} referenced profile image(s) were missing and skipped.`)
+        }
+        if (!showBackupWarning('Partial backup successful.', warnings)) {
             notifySuccess('Success')
         }
     } catch (error) {
@@ -358,7 +442,10 @@ export async function SaveServerBackup() {
             const bytesStr = formatBytes(bytes)
             alertWait(`${language.serverBackupSaving} (${pct}% - ${bytesStr})`)
         })
-        notifySuccess(language.serverBackupSaveSuccess(result.filename, formatBytes(result.size)))
+        const successMessage = language.serverBackupSaveSuccess(result.filename, formatBytes(result.size))
+        if (!showBackupWarning(successMessage, missingRowWarningItems(result))) {
+            notifySuccess(successMessage)
+        }
     } catch (error) {
         console.error(error)
         alertError(error instanceof Error ? error.message : 'Server backup failed')

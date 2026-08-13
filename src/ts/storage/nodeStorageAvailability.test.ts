@@ -139,6 +139,31 @@ describe('NodeStorage availability bounds', () => {
         )
     })
 
+    it('returns missing-row details from the server-backup terminal event', async () => {
+        const terminal = {
+            type: 'done',
+            ok: true,
+            filename: 'risu-backup-warning.bin',
+            size: 4096,
+            missingChats: 1,
+            missingChatList: ['character-id/chat-id'],
+            missingMcpToolCalls: 1,
+            missingMcpToolCallList: ['call-missing'],
+        }
+        const fetchMock = vi.fn(async () => new Response(`${JSON.stringify(terminal)}\n`, {
+            status: 200,
+            headers: { 'content-type': 'application/x-ndjson' },
+        }))
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        await expect(storage.saveServerBackup()).resolves.toEqual(terminal)
+        expect(fetchMock).toHaveBeenCalledWith(
+            '/api/backup/server/save',
+            expect.objectContaining({ method: 'POST' }),
+        )
+    })
+
     it('polls a partial export job past the generic 15 second read bound', async () => {
         vi.useFakeTimers()
         const startedAt = Date.now()
