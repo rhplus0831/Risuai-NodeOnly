@@ -941,10 +941,10 @@ function queueStorageMutation(operation, label = 'unlabeled') {
 }
 
 // ─── SQLite durability policy ───────────────────────────────────────────────
-// The database module opens in FULL so early migrations and invalid/missing
-// configuration fail safe. Self-hosted administrators can explicitly trade a
-// bounded power-loss window for fewer commit-time fsyncs; hub mode is always
-// server-admin managed through POCKETRISU_SQLITE_DURABILITY_MODE.
+// The database module opens in FULL so work before policy selection fails safe.
+// Unmanaged self-hosted installs default to performance, while persisted choices
+// still win. Hub hosting and an explicit environment value remain server-admin
+// managed and fail safe to durable when no valid managed mode is available.
 const SQLITE_DURABILITY_CONFIG_KEY = 'config/sqlite-durability-mode';
 const SQLITE_DURABILITY_ENV_KEY = 'POCKETRISU_SQLITE_DURABILITY_MODE';
 const SQLITE_MAINTENANCE_CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000;
@@ -991,7 +991,7 @@ function readPersistedSqliteDurabilityMode() {
 
 let sqliteDurabilityMode = sqliteDurabilityManaged
     ? (sqliteDurabilityEnvMode || 'durable')
-    : (readPersistedSqliteDurabilityMode() || 'durable');
+    : (readPersistedSqliteDurabilityMode() || 'performance');
 let sqliteDurabilityTimer = null;
 let sqliteDurabilitySchedulerStarted = false;
 let lastWalCheckpointAttempt = null;
@@ -1160,7 +1160,8 @@ function rescheduleSqliteDurabilityCheckpoint() {
 }
 
 // db.cjs deliberately started in FULL. This is the only startup point that may
-// downgrade it, and only after an explicit valid persisted/admin choice exists.
+// downgrade it, after the effective persisted, managed, or self-hosted-default
+// profile has been selected.
 applySqliteDurabilityMode();
 
 // Imports hold a raw transaction outside the storage queue. Wait before

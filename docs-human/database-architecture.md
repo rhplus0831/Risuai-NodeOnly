@@ -291,9 +291,13 @@ detection is skipped; orphans wait for `/api/db/optimize` (1-hour grace).
   instead of silently joining a transaction that may roll back.
 - Writer fencing: last `/api/session` caller wins; displaced sessions get 423 on
   mutations. Requests without `x-session-id` bypass the fence (compatibility).
-- SQLite runs WAL + `synchronous=FULL` by default (`balanced`/`performance` modes
-  drop to `NORMAL` with documented 1/5-minute power-loss windows). Transactions are
-  the crash-atomicity boundary; the one exception is the patch debounce window above.
+- SQLite opens with WAL + `synchronous=FULL` as a startup fail-safe, then fresh
+  unmanaged self-hosted installs apply the default `performance` profile
+  (`synchronous=NORMAL` with a documented five-minute power-loss window). Persisted
+  dashboard choices take precedence. Hub hosting or an explicit
+  `POCKETRISU_SQLITE_DURABILITY_MODE` remains administrator-managed and fails safe to
+  `durable`; `balanced` uses `NORMAL` with a one-minute window. Transactions are the
+  crash-atomicity boundary; the one exception is the patch debounce window above.
 
 ---
 

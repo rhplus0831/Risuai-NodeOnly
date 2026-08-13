@@ -44,22 +44,22 @@ async function setDurability(
 }
 
 describe('SQLite durability policy', () => {
-  test('defaults to FULL and makes explicit flush a verified durability boundary', async () => {
+  test('defaults unmanaged self-hosting to performance and keeps explicit flush durable', async () => {
     const server = await spawnServer()
     try {
       const client = await createClient(server.port, server.password)
       const state = await readDurability(client)
       expect(state).toMatchObject({
-        mode: 'durable',
+        mode: 'performance',
         managed: false,
         managedBy: null,
-        synchronous: 'FULL',
-        checkpointIntervalMs: null,
-        powerLossWindowMs: 0,
+        synchronous: 'NORMAL',
+        checkpointIntervalMs: 300_000,
+        powerLossWindowMs: 300_000,
       })
 
       const stats = await (await client.fetch('/api/db/stats')).json() as Record<string, any>
-      expect(stats.sqlite.synchronous).toBe(2)
+      expect(stats.sqlite.synchronous).toBe(1)
 
       const cookie = await createSessionCookie(client)
       const key = 'test/sqlite-durability'

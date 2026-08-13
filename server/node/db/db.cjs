@@ -49,9 +49,9 @@ function getPluginStorageMutationVersion() {
 
 // WAL mode: better concurrent read performance, single-writer
 db.pragma('journal_mode = WAL');
-// Start in the power-loss durable mode. server.cjs may apply an explicit
-// operator-selected downgrade after it has loaded the persisted server setting,
-// but missing/invalid settings and early startup migrations must stay safe.
+// Start in the power-loss durable mode so early startup work stays safe.
+// server.cjs applies the effective persisted, managed, or self-hosted-default
+// profile only after this initialization boundary.
 db.pragma('synchronous = FULL');
 db.pragma('cache_size = -64000');       // 64 MB (default 2 MB) — reduce disk I/O for large blobs
 db.pragma('temp_store = MEMORY');       // keep temp tables in RAM

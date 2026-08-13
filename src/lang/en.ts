@@ -2087,8 +2087,8 @@ export const languageEnglish = {
 
     // SQLite durability
     storageDurability: "SQLite durability",
-    storageDurabilityDesc: "Choose when acknowledged server writes are forced to stable storage. Durable is the safe default; the other modes reduce disk-sync overhead by accepting a power-loss window.",
-    storageDurabilityDurable: "Durable (recommended)",
+    storageDurabilityDesc: "Choose when acknowledged server writes are forced to stable storage. Unmanaged self-hosted installs default to Performance; managed installs follow the server administrator's policy.",
+    storageDurabilityDurable: "Durable",
     storageDurabilityDurableDesc: "Uses synchronous=FULL. Each committed transaction is durable before PocketRisu acknowledges it.",
     storageDurabilityBalanced: "Balanced",
     storageDurabilityBalancedDesc: "Uses synchronous=NORMAL with a verified checkpoint about every minute. A host crash or power loss can discard recent writes, possibly for longer if a checkpoint is delayed.",

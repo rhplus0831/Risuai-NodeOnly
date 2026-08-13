@@ -2287,8 +2287,8 @@ export const languageKorean = {
   // SQLite 내구성
   storageDurability: "SQLite 내구성",
   storageDurabilityDesc:
-    "서버가 저장 성공을 알리기 전에 데이터를 안정적인 저장 장치에 기록할 시점을 선택합니다. 내구성 모드가 안전한 기본값이며, 다른 모드는 정전 시 데이터 손실 가능성을 감수하고 디스크 동기화 부하를 줄입니다.",
-  storageDurabilityDurable: "내구성 (권장)",
+    "서버가 저장 성공을 알리기 전에 데이터를 안정적인 저장 장치에 기록할 시점을 선택합니다. 관리되지 않는 자체 호스팅 설치의 기본값은 성능 모드이며, 관리형 설치는 서버 관리자 정책을 따릅니다.",
+  storageDurabilityDurable: "내구성",
   storageDurabilityDurableDesc:
     "synchronous=FULL을 사용합니다. PocketRisu가 성공을 알리기 전에 각 트랜잭션을 안전하게 기록합니다.",
   storageDurabilityBalanced: "균형",
