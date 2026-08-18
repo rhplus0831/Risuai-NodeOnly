@@ -5032,13 +5032,14 @@ export class NodeStorage{
     async exportBackup(
         opts?: {
             target?: 'upstream' | 'main'
-            scope?: 'partial'
+            scope?: 'partial' | 'full'
             signal?: AbortSignal | null
             onPreparationProgress?: (progress: {
                 phase: string
                 current: number
                 total: number
                 bytes: number
+                totalBytes: number
             }) => void
         },
         externalSignal?: AbortSignal | null,
@@ -5046,7 +5047,8 @@ export class NodeStorage{
         const callerSignal = externalSignal ?? opts?.signal
         throwIfAborted(callerSignal)
 
-        if (opts?.scope === 'partial') {
+        {
+            const scope = opts?.scope ?? 'full'
             // The client chooses the stable id before POST so a lost create
             // acknowledgement can still be cancelled deterministically.
             let jobId: string | null = uuidv4()
@@ -5085,7 +5087,13 @@ export class NodeStorage{
                 }>('/api/backup/export/jobs', {
                     method: 'POST',
                     headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify({ scope: 'partial', jobId }),
+                    body: JSON.stringify({
+                        scope,
+                        ...(scope === 'full'
+                            ? { target: opts?.target ?? 'nodeonly' }
+                            : {}),
+                        jobId,
+                    }),
                 })
                 if (!created.response.ok || typeof created.body.jobId !== 'string') {
                     throw new Error(created.body.error || `backup export prepare error: ${created.response.status}`)
@@ -5100,6 +5108,7 @@ export class NodeStorage{
                         current?: number
                         total?: number
                         bytes?: number
+                        totalBytes?: number
                         error?: string
                     }>(`/api/backup/export/jobs/${encodeURIComponent(jobId)}`)
                     if (!statusResult.response.ok) {
@@ -5111,10 +5120,11 @@ export class NodeStorage{
                         current: Number(status.current ?? 0),
                         total: Number(status.total ?? 0),
                         bytes: Number(status.bytes ?? 0),
+                        totalBytes: Number(status.totalBytes ?? 0),
                     })
                     if (status.state === 'ready') break
                     if (status.state === 'failed' || status.state === 'cancelled') {
-                        throw new Error(status.error || `Partial backup export ${status.state}`)
+                        throw new Error(status.error || `Backup export ${status.state}`)
                     }
                     await awaitWithAbort(
                         new Promise<void>(resolve => setTimeout(resolve, 250)),
@@ -5143,30 +5153,6 @@ export class NodeStorage{
                 throw error
             }
         }
-
-        const params = new URLSearchParams()
-        if (opts?.target) params.set('target', opts.target)
-        const query = params.toString()
-        const url = `/api/backup/export${query ? `?${query}` : ''}`
-        // Backup preparation can legitimately take longer than ordinary
-        // metadata work. The returned stream remains caller-owned.
-        const da = callerSignal
-            ? await this.authFetch(url, { signal: callerSignal })
-            : await this.boundedAuthFetch(
-                url,
-                {},
-                'read',
-                AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS,
-            )
-        if (da.status < 200 || da.status >= 300) {
-            const detail = await da.json().catch(() => null) as { error?: unknown } | null
-            throw new Error(
-                typeof detail?.error === 'string'
-                    ? detail.error
-                    : `backup export error: ${da.status}`,
-            )
-        }
-        return da
     }
 
     async prepareImport(size: number, allowLargeRestore = false): Promise<void> {

@@ -111,18 +111,39 @@ describe('NodeStorage availability bounds', () => {
     })
 
     it('requests the dedicated main-compatible export target', async () => {
-        const fetchMock = vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), {
-            status: 200,
-        }))
+        const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input)
+            if (url === '/api/backup/export/jobs' && init?.method === 'POST') {
+                return new Response(JSON.stringify({ jobId: 'main-job', state: 'preparing' }), {
+                    status: 202,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            if (url === '/api/backup/export/jobs/main-job') {
+                return new Response(JSON.stringify({ state: 'ready', phase: 'ready' }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            if (url === '/api/backup/export/jobs/main-job/download') {
+                return new Response(new Uint8Array([1, 2, 3]), { status: 200 })
+            }
+            throw new Error(`Unexpected request: ${url}`)
+        })
         vi.stubGlobal('fetch', fetchMock)
         const storage = readyStorage()
 
         await expect(storage.exportBackup({ target: 'main' })).resolves.toBeInstanceOf(Response)
 
-        expect(fetchMock).toHaveBeenCalledWith(
-            '/api/backup/export?target=main',
-            expect.objectContaining({ headers: expect.any(Headers) }),
-        )
+        const createCall = fetchMock.mock.calls.find(([url]) => (
+            String(url) === '/api/backup/export/jobs'
+        ))
+        expect(createCall).toBeTruthy()
+        expect(JSON.parse(String(createCall![1]?.body))).toMatchObject({
+            scope: 'full',
+            target: 'main',
+        })
+        expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/download'))).toBe(true)
     })
 
     it('surfaces a main-target compatibility rejection from the server', async () => {
@@ -211,17 +232,23 @@ describe('NodeStorage availability bounds', () => {
         expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/download'))).toBe(true)
     })
 
-    it('bounds a stalled full export at the long-job ceiling', async () => {
+    it('bounds a stalled full-job create request at the ordinary I/O ceiling', async () => {
         vi.useFakeTimers()
         let requestSignal: AbortSignal | undefined
         vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+            if (init?.method === 'DELETE') {
+                return Promise.resolve(new Response(JSON.stringify({ ok: true }), {
+                    status: 202,
+                    headers: { 'content-type': 'application/json' },
+                }))
+            }
             requestSignal = init?.signal ?? undefined
             return new Promise<Response>(() => undefined)
         }))
         const storage = readyStorage()
 
         const exported = storage.exportBackup().catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
 
         await expect(exported).resolves.toMatchObject({
             code: 'STORAGE_TIMEOUT',

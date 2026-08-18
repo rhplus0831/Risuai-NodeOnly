@@ -461,6 +461,49 @@ describe('SavePartialLocalBackup', () => {
 })
 
 describe('full backup missing-row warnings', () => {
+    test('reports full-job preparation progress before downloading', async () => {
+        mocks.exportBackup.mockImplementationOnce(async (options) => {
+            options.onPreparationProgress({
+                phase: 'pinning-files',
+                current: 200,
+                total: 1000,
+                bytes: 2048,
+                totalBytes: 4096,
+            })
+            return backupResponse()
+        })
+
+        await SaveLocalBackup()
+
+        expect(mocks.alertWait).toHaveBeenCalledWith(
+            expect.stringContaining('pinning-files 200/1000, 2.0 KB/4.0 KB'),
+            expect.any(Function),
+        )
+    })
+
+    test('offers a cancel action for full-job preparation', async () => {
+        mocks.exportBackup.mockImplementationOnce(async (options) => (
+            new Promise((_resolve, reject) => {
+                options.signal.addEventListener('abort', () => {
+                    reject(options.signal.reason)
+                }, { once: true })
+            })
+        ))
+
+        const saving = SaveLocalBackup()
+        await vi.waitFor(() => expect(mocks.exportBackup).toHaveBeenCalled())
+        const cancelAction = mocks.alertWait.mock.calls
+            .map(call => call[1])
+            .find(action => typeof action === 'function')
+        expect(cancelAction).toBeTypeOf('function')
+        cancelAction()
+        await saving
+
+        expect(mocks.alertClear).toHaveBeenCalledOnce()
+        expect(mocks.notifyInfo).toHaveBeenCalledWith('Backup cancelled')
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
     test.each([
         ['node-only', SaveLocalBackup, undefined],
         ['upstream', SaveLocalBackupForUpstream, { target: 'upstream' }],
@@ -479,11 +522,11 @@ describe('full backup missing-row warnings', () => {
 
         await save()
 
-        if (expectedOptions) {
-            expect(mocks.exportBackup).toHaveBeenCalledWith(expectedOptions)
-        } else {
-            expect(mocks.exportBackup).toHaveBeenCalledWith()
-        }
+        expect(mocks.exportBackup).toHaveBeenCalledWith(expect.objectContaining({
+            ...(expectedOptions ?? {}),
+            signal: expect.any(AbortSignal),
+            onPreparationProgress: expect.any(Function),
+        }))
         expect(mocks.alertMd).toHaveBeenCalledWith(expect.stringContaining('character-id/chat-id'))
         expect(mocks.alertMd).toHaveBeenCalledWith(expect.stringContaining('call-full-missing'))
         expect(mocks.notifySuccess).not.toHaveBeenCalled()
@@ -517,7 +560,11 @@ describe('SaveLocalBackupForMain', () => {
     test('downloads only through the dedicated main target', async () => {
         await SaveLocalBackupForMain()
 
-        expect(mocks.exportBackup).toHaveBeenCalledWith({ target: 'main' })
+        expect(mocks.exportBackup).toHaveBeenCalledWith(expect.objectContaining({
+            target: 'main',
+            signal: expect.any(AbortSignal),
+            onPreparationProgress: expect.any(Function),
+        }))
         expect(mocks.downloadFile).toHaveBeenCalledWith(
             'server-partial.bin',
             new Uint8Array([1, 2, 3, 4]),

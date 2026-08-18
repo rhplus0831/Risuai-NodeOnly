@@ -122,7 +122,10 @@ async function waitForNewSnapshot(
   throw new Error('Timed out waiting for an MCP recovery snapshot')
 }
 
-async function createPartialBackup(client: RisuClient): Promise<{
+async function createJobBackup(
+  client: RisuClient,
+  scope: 'partial' | 'full',
+): Promise<{
   archive: Buffer
   headers: Headers
 }> {
@@ -130,7 +133,7 @@ async function createPartialBackup(client: RisuClient): Promise<{
   const create = await client.fetch('/api/backup/export/jobs', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ scope: 'partial', jobId }),
+    body: JSON.stringify({ scope, jobId, ...(scope === 'full' ? { target: 'nodeonly' } : {}) }),
   })
   expect(create.status).toBe(202)
   const deadline = Date.now() + 8_000
@@ -147,11 +150,11 @@ async function createPartialBackup(client: RisuClient): Promise<{
       }
     }
     if (status.state === 'failed' || status.state === 'cancelled') {
-      throw new Error(status.error ?? `Partial backup ${status.state}`)
+      throw new Error(status.error ?? `${scope} backup ${status.state}`)
     }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
-  throw new Error('Timed out waiting for the partial MCP recovery backup')
+  throw new Error(`Timed out waiting for the ${scope} MCP recovery backup`)
 }
 
 describe('remembered MCP tool-call recovery', () => {
@@ -185,7 +188,7 @@ describe('remembered MCP tool-call recovery', () => {
     expect(JSON.parse(savedEntries.get(mcpStorageKey(callId))!.toString('utf8'))).toEqual(payload(callId))
     expect(savedEntries.has(mcpStorageKey(unreferencedId))).toBe(false)
 
-    const partialBackup = await createPartialBackup(sourceClient)
+    const partialBackup = await createJobBackup(sourceClient, 'partial')
     const partialEntries = new Map(
       decodeBackup(partialBackup.archive).map(entry => [entry.name, entry.data]),
     )
@@ -249,7 +252,13 @@ describe('remembered MCP tool-call recovery', () => {
     const savedEntries = decodeBackup(Buffer.from(await savedDownload.arrayBuffer()))
     expect(savedEntries.some(entry => entry.name === mcpStorageKey(callId))).toBe(false)
 
-    const partial = await createPartialBackup(client)
+    const fullJob = await createJobBackup(client, 'full')
+    expect(fullJob.headers.get('x-risu-backup-missing-mcp-tool-calls')).toBe('1')
+    expect(fullJob.headers.get('x-risu-backup-missing-mcp-tool-call-list')).toBe(callId)
+    expect(decodeBackup(fullJob.archive).some(entry => entry.name === mcpStorageKey(callId)))
+      .toBe(false)
+
+    const partial = await createJobBackup(client, 'partial')
     expect(partial.headers.get('x-risu-backup-missing-mcp-tool-calls')).toBe('1')
     expect(partial.headers.get('x-risu-backup-missing-mcp-tool-call-list')).toBe(callId)
     const partialEntries = decodeBackup(partial.archive)
@@ -301,5 +310,50 @@ describe('remembered MCP tool-call recovery', () => {
     const liveDatabase = decodeRisuDat(readKvValue(server.cwd, DB_BLOB_KEY)!)
     expect(liveDatabase).not.toHaveProperty(MCP_SNAPSHOT_FIELD)
     expect(liveDatabase).not.toHaveProperty(MCP_SNAPSHOT_MARKER)
+  })
+
+  test('automatic snapshot preserves history when a referenced payload is already missing', async () => {
+    const callId = 'call-snapshot-missing'
+    const server = await spawnServer({
+      env: { POCKETRISU_BACKUP_INTERVAL_MS: '0' },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    expect((await client.importBackup(recoverySeed({
+      callId,
+      includePayload: false,
+    }))).ok).toBe(true)
+
+    const before = new Set((await listSnapshots(client)).map(snapshot => snapshot.key))
+    await new Promise(resolve => setTimeout(resolve, 125))
+    await writeKv(client, DB_BLOB_KEY, readKvValue(server.cwd, DB_BLOB_KEY)!)
+    const snapshot = await waitForNewSnapshot(client, before)
+    const snapshotDatabase = decodeRisuDat(
+      readKvValue(server.cwd, snapshot.key)!,
+    ) as Record<string, any>
+
+    expect(snapshotDatabase[MCP_SNAPSHOT_MARKER]).toBe(true)
+    expect(snapshotDatabase[MCP_SNAPSHOT_FIELD]).toEqual({})
+    expect(snapshotDatabase.characters[0].chats[0].message[1].data)
+      .toContain(`<tool_call>${callId}\uf100lookup</tool_call>`)
+  })
+
+  test('automatic snapshot still fails closed for a present corrupt payload', async () => {
+    const callId = 'call-snapshot-corrupt'
+    const server = await spawnServer({
+      env: { POCKETRISU_BACKUP_INTERVAL_MS: '0' },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    expect((await client.importBackup(recoverySeed({ callId }))).ok).toBe(true)
+
+    const before = new Set((await listSnapshots(client)).map(snapshot => snapshot.key))
+    await new Promise(resolve => setTimeout(resolve, 125))
+    await writeKv(client, mcpStorageKey(callId), Buffer.from('{invalid json', 'utf8'))
+    await writeKv(client, DB_BLOB_KEY, readKvValue(server.cwd, DB_BLOB_KEY)!)
+    await new Promise(resolve => setTimeout(resolve, 300))
+
+    const after = await listSnapshots(client)
+    expect(after.some(snapshot => !before.has(snapshot.key))).toBe(false)
   })
 })

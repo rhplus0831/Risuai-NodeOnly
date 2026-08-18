@@ -1221,6 +1221,8 @@ async function createBackupAndRotate() {
 
     backupCreationInFlight = true;
     let backupDbSpool = null;
+    let missingMcpToolCalls = 0;
+    const missingMcpToolCallList = [];
     try {
         const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
         const raw = kvGet('database/database.bin');
@@ -1236,7 +1238,19 @@ async function createBackupAndRotate() {
             onMissingChatRow: (chaId, chatId) => {
                 warnAndPreserveMissingChatRow('Snapshot', chaId, chatId);
             },
+            onMissingMcpToolCallRow: (callId) => {
+                missingMcpToolCalls++;
+                appendBackupMissingRowDetail(missingMcpToolCallList, callId);
+            },
         });
+        if (missingMcpToolCalls > 0) {
+            const details = missingMcpToolCallList.length > 0
+                ? ` (${missingMcpToolCallList.join(', ')})`
+                : '';
+            logger.warn(
+                `[Snapshot] Skipped ${missingMcpToolCalls} missing remembered MCP tool-call payload(s)${details}`
+            );
+        }
         // Test-only, opt-in publication gate. It sits after assembly so tests
         // can replace T1 with T2 while the T1 spool is genuinely in flight and
         // verify the compare-token acknowledgement at publication.
@@ -2075,6 +2089,10 @@ const PARTIAL_EXPORT_GC_INTERVAL_MS = Number.isSafeInteger(configuredPartialExpo
     && configuredPartialExportGcIntervalMs >= 10
     ? configuredPartialExportGcIntervalMs
     : 60 * 1000;
+// Preparation and a multi-gigabyte download can legitimately take hours. Keep
+// a finite last-resort deadline for abandoned work while avoiding the short
+// ready-job TTL during active preparation or streaming.
+const BACKUP_EXPORT_ACTIVE_TTL_MS = 24 * 60 * 60 * 1000;
 // A client can time out its create POST and send DELETE before the POST reaches
 // admission. Remember that exact owner/id cancellation for a bounded window so
 // the delayed create cannot resurrect a job after cleanup appeared to succeed.
@@ -6018,6 +6036,7 @@ async function spoolSelfContainedBackupDatabase(
         shouldAbort = () => false,
         reader = { kvGet, kvList, kvListWithSizes },
         onMissingChatRow,
+        onMissingMcpToolCallRow,
     } = {}
 ) {
     const finalPath = path.join(
@@ -6045,6 +6064,7 @@ async function spoolSelfContainedBackupDatabase(
             markPluginStorageFolded,
             shouldAbort,
             onMissingChatRow,
+            onMissingMcpToolCallRow,
         });
     } catch (error) {
         await fs.unlink(filePath).catch(() => {});
@@ -6564,7 +6584,12 @@ async function hashBackupExportFile(entry, signal) {
     }
 }
 
-async function copyBackupExportFile(entry, destination, signal) {
+async function copyBackupExportFile(
+    entry,
+    destination,
+    signal,
+    onCopyProgress = () => {},
+) {
     const source = await fs.open(entry.sourcePath, 'r');
     let output = null;
     try {
@@ -6598,6 +6623,7 @@ async function copyBackupExportFile(entry, destination, signal) {
             }
             digest.update(chunk);
             offset += bytesRead;
+            onCopyProgress(offset);
             if (pageDelayMs > 0) {
                 await new Promise((resolve) => setTimeout(resolve, pageDelayMs));
             }
@@ -6609,11 +6635,18 @@ async function copyBackupExportFile(entry, destination, signal) {
             throw new Error(`Backup source changed while pinning: ${entry.backupName}`);
         }
         const pinnedHash = digest.digest('hex');
-        const stableHash = await hashBackupExportFile(entry, signal);
-        if (pinnedHash !== stableHash) {
-            throw new Error(`Backup source content changed while pinning: ${entry.backupName}`);
+        if (entry.expectedDigest) {
+            if (pinnedHash !== entry.expectedDigest) {
+                throw new Error(`Backup source content does not match its asset name: ${entry.backupName}`);
+            }
+        } else {
+            const stableHash = await hashBackupExportFile(entry, signal);
+            if (pinnedHash !== stableHash) {
+                throw new Error(`Backup source content changed while pinning: ${entry.backupName}`);
+            }
         }
-        await output.sync();
+        // Pins are disposable process-local job artifacts. Closing the file is
+        // sufficient; restart cleanup discards the whole unpublished job.
         await output.close();
         output = null;
         return {
@@ -6629,13 +6662,19 @@ async function copyBackupExportFile(entry, destination, signal) {
     }
 }
 
-async function planFullBackupFilesystemEntries(snapshot, target) {
+async function planFullBackupFilesystemEntries(snapshot, target, onProgress = () => {}) {
     const entries = [];
-    for (const asset of listAssetEntriesWithSizes(snapshot)) {
+    const assets = listAssetEntriesWithSizes(snapshot);
+    let plannedBytes = 0;
+    let planned = 0;
+    let lastPlanningProgressAt = 0;
+    for (const asset of assets) {
         const backupName = path.basename(asset.key);
         if (asset.source === 'fs') {
-            const sourcePath = assetPathFor(assetNameForKey(asset.key));
+            const assetName = assetNameForKey(asset.key);
+            const sourcePath = assetPathFor(assetName);
             const sourceStat = await fs.stat(sourcePath);
+            const digestMatch = assetName.match(/^([0-9a-f]{64})\.[A-Za-z0-9]{1,10}$/);
             entries.push({
                 kind: 'source-file',
                 sourcePath,
@@ -6643,6 +6682,7 @@ async function planFullBackupFilesystemEntries(snapshot, target) {
                 backupName,
                 sortKey: asset.key,
                 size: sourceStat.size,
+                expectedDigest: digestMatch && !asset.legacyHash ? digestMatch[1] : null,
             });
         } else {
             // Preserve the source chosen at the cut. A filesystem file created
@@ -6655,12 +6695,27 @@ async function planFullBackupFilesystemEntries(snapshot, target) {
                 size: asset.size,
             });
         }
+        planned++;
+        plannedBytes += entries.at(-1)?.size ?? 0;
+        const now = Date.now();
+        if (planned % 100 === 0 || planned === assets.length
+            || now - lastPlanningProgressAt >= 250) {
+            lastPlanningProgressAt = now;
+            onProgress({
+                phase: 'planning-files',
+                current: planned,
+                total: assets.length,
+                bytes: plannedBytes,
+                totalBytes: 0,
+            });
+        }
     }
     // Original upstream cannot import PocketRisu's slash-named inlay entries.
     // The PocketRisu main rollback target can, so retain them there.
     if (target === 'upstream') return entries;
 
-    for (const inlay of await listInlayFiles()) {
+    const inlays = await listInlayFiles();
+    for (const inlay of inlays) {
         const sourceStat = await fs.stat(inlay.filePath);
         entries.push({
             kind: 'source-file',
@@ -6683,6 +6738,20 @@ async function planFullBackupFilesystemEntries(snapshot, target) {
             });
         } catch (error) {
             if (error?.code !== 'ENOENT') throw error;
+        }
+        planned++;
+        plannedBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
+        const now = Date.now();
+        if (planned % 100 === 0 || planned === assets.length + inlays.length
+            || now - lastPlanningProgressAt >= 250) {
+            lastPlanningProgressAt = now;
+            onProgress({
+                phase: 'planning-files',
+                current: planned,
+                total: assets.length + inlays.length,
+                bytes: plannedBytes,
+                totalBytes: 0,
+            });
         }
     }
     return entries;
@@ -7207,7 +7276,12 @@ async function validateFullBackupDatabase(snapshot, key, size, signal) {
     }
 }
 
-async function pinFullBackupState({ target, signal, archiveTargetPath = null }) {
+async function pinFullBackupState({
+    target,
+    signal,
+    archiveTargetPath = null,
+    onProgress = () => {},
+}) {
     throwIfBackupExportAborted(signal);
     if (activeFullExportPins.size >= FULL_EXPORT_MAX_ACTIVE_PINS) {
         throw backupExportCapacityError();
@@ -7223,6 +7297,13 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
             await flushPendingDb();
             throwIfBackupExportAborted(signal);
             snapshot = createKvSnapshot();
+            onProgress({
+                phase: 'validating-database',
+                current: 0,
+                total: 0,
+                bytes: 0,
+                totalBytes: 0,
+            });
 
             const databaseKey = 'database/database.bin';
             let databaseSize;
@@ -7249,7 +7330,11 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
                 }
                 throw fullBackupDatabaseUnavailableError(cause);
             }
-            const filesystemEntries = await planFullBackupFilesystemEntries(snapshot, target);
+            const filesystemEntries = await planFullBackupFilesystemEntries(
+                snapshot,
+                target,
+                onProgress,
+            );
             const includeInlays = target !== 'upstream';
             const includeServeOnlyRows = target === 'nodeonly';
             const foldPluginStorage = target !== 'nodeonly';
@@ -7352,6 +7437,13 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
                     bytes: archiveRequired,
                 });
             }
+            onProgress({
+                phase: 'reserving-disk',
+                current: 0,
+                total: reservationEntries.length,
+                bytes: 0,
+                totalBytes: pinPayloadBytes,
+            });
             reservation = await reserveFullExportDisk(token, requirements);
 
             pinDir = path.join(
@@ -7381,8 +7473,14 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
             const plannedEntries = [...filesystemEntries, ...snapshotEntries]
                 .sort((a, b) => a.sortKey.localeCompare(b.sortKey));
             preflightBackupEntries(plannedEntries);
+            const plannedEntryBytes = plannedEntries.reduce(
+                (sum, entry) => sum + entry.size,
+                0,
+            );
             const pinnedEntries = [];
             let index = 0;
+            let pinnedBytes = 0;
+            let lastProgressAt = 0;
             for (const entry of plannedEntries) {
                 throwIfBackupExportAborted(signal);
                 if (entry.kind !== 'source-file') {
@@ -7394,11 +7492,40 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
                         signal,
                     ));
                     index++;
-                    continue;
+                } else {
+                    const destination = path.join(pinDir, `${String(index).padStart(8, '0')}.pin`);
+                    pinnedEntries.push(await copyBackupExportFile(
+                        entry,
+                        destination,
+                        signal,
+                        (fileBytes) => {
+                            const now = Date.now();
+                            if (now - lastProgressAt < 250) return;
+                            lastProgressAt = now;
+                            onProgress({
+                                phase: 'pinning-files',
+                                current: index,
+                                total: plannedEntries.length,
+                                bytes: pinnedBytes + fileBytes,
+                                totalBytes: plannedEntryBytes,
+                            });
+                        },
+                    ));
+                    index++;
                 }
-                const destination = path.join(pinDir, `${String(index).padStart(8, '0')}.pin`);
-                pinnedEntries.push(await copyBackupExportFile(entry, destination, signal));
-                index++;
+                pinnedBytes += entry.size;
+                const now = Date.now();
+                if (index % 100 === 0 || index === plannedEntries.length
+                    || now - lastProgressAt >= 250) {
+                    lastProgressAt = now;
+                    onProgress({
+                        phase: 'pinning-files',
+                        current: index,
+                        total: plannedEntries.length,
+                        bytes: pinnedBytes,
+                        totalBytes: plannedEntryBytes,
+                    });
+                }
             }
             preflightBackupEntries([
                 ...pinnedEntries,
@@ -7523,7 +7650,7 @@ function wasPartialExportCancelled(owner, jobId) {
 function partialExportJobForRequest(req, res) {
     const job = partialExportJobs.get(req.params.jobId);
     if (!job || job.owner !== partialExportOwner(req)) {
-        res.status(404).json({ error: 'Partial export job not found' });
+        res.status(404).json({ error: 'Backup export job not found' });
         return null;
     }
     return job;
@@ -7531,7 +7658,7 @@ function partialExportJobForRequest(req, res) {
 
 function throwIfPartialExportCancelled(job) {
     if (job.abortController.signal.aborted) {
-        const error = new Error('Partial export was cancelled');
+        const error = new Error('Backup export was cancelled');
         error.name = 'AbortError';
         throw error;
     }
@@ -7540,11 +7667,17 @@ function throwIfPartialExportCancelled(job) {
 async function cleanupPartialExportArtifacts(job) {
     try { job.snapshot?.close(); } catch {}
     job.snapshot = null;
+    if (job.fullPinnedState) {
+        await cleanupFullBackupState(job.fullPinnedState);
+        job.fullPinnedState = null;
+    }
     if (job.databaseSpool?.filePath) {
         await fs.unlink(job.databaseSpool.filePath).catch(() => {});
     }
     job.databaseSpool = null;
-    await fs.rm(job.spoolDir, { recursive: true, force: true }).catch(() => {});
+    if (job.spoolDir) {
+        await fs.rm(job.spoolDir, { recursive: true, force: true }).catch(() => {});
+    }
 }
 
 async function cleanupPartialExportJob(job) {
@@ -7821,6 +7954,90 @@ async function preparePartialExportJob(job) {
             logger.error('[Partial Backup Export] Preparation failed:', error);
             job.state = 'failed';
             job.error = error?.message || String(error);
+            job.progress.phase = 'failed';
+            job.expiresAt = Date.now() + PARTIAL_EXPORT_JOB_TTL_MS;
+            await cleanupPartialExportArtifacts(job);
+        } else {
+            job.state = 'cancelled';
+            await cleanupPartialExportJob(job);
+        }
+    }
+}
+
+async function prepareFullExportJob(job) {
+    const signal = job.abortController.signal;
+    const shouldAbort = () => signal.aborted;
+    const missingRowsCollector = createBackupMissingRowsCollector(
+        `Full Export Job (${job.target})`,
+    );
+    job.missingRows = missingRowsCollector.result;
+    try {
+        job.progress.phase = 'validating-database';
+        const pinnedState = await pinFullBackupState({
+            target: job.target,
+            signal,
+            onProgress: (progress) => Object.assign(job.progress, progress),
+        });
+        job.fullPinnedState = pinnedState;
+        await waitAtFullExportAfterPinTestGate(signal);
+        throwIfPartialExportCancelled(job);
+
+        job.progress.phase = 'assembling-database';
+        job.databaseSpool = await buildSelfContainedBackupDatabase({
+            foldPluginStorage: job.target !== 'nodeonly',
+            shouldAbort,
+            snapshot: pinnedState.snapshot,
+            databaseSource: pinnedState.databaseSource,
+            databaseState: pinnedState.databaseState,
+            signal,
+            onMissingChatRow: missingRowsCollector.onMissingChatRow,
+        });
+        if (job.target === 'main') {
+            await requireMainCompatibleBackupDatabase(job.databaseSpool);
+        }
+        throwIfPartialExportCancelled(job);
+
+        job.progress.phase = 'selecting-rows';
+        job.entries = job.target === 'nodeonly'
+            ? await selectReferencedMcpToolCallEntries(
+                pinnedState.entries,
+                job.databaseSpool,
+                shouldAbort,
+                missingRowsCollector.onMissingMcpToolCallRow,
+            )
+            : pinnedState.entries;
+        const databaseSize = job.databaseSpool?.size ?? 0;
+        preflightBackupEntries([
+            ...job.entries,
+            ...(databaseSize
+                ? [{ backupName: 'database.risudat', size: databaseSize }]
+                : []),
+        ]);
+        job.size = job.entries.reduce(
+            (sum, entry) => sum + backupEntrySize(entry.backupName, entry.size),
+            0,
+        ) + (databaseSize ? backupEntrySize('database.risudat', databaseSize) : 0);
+        job.totalEntries = job.entries.length + (databaseSize ? 1 : 0);
+
+        // Ready downloads are backed only by immutable private files. Release
+        // the SQLite WAL reader before the job waits for the browser.
+        try { pinnedState.snapshot?.close(); } catch {}
+        pinnedState.snapshot = null;
+        job.state = 'ready';
+        job.progress = {
+            phase: 'ready',
+            current: job.totalEntries,
+            total: job.totalEntries,
+            bytes: job.size,
+            totalBytes: job.size,
+        };
+        job.expiresAt = Date.now() + PARTIAL_EXPORT_JOB_TTL_MS;
+    } catch (error) {
+        if (!signal.aborted) {
+            logger.error('[Full Backup Export Job] Preparation failed:', error);
+            job.state = 'failed';
+            job.error = error?.message || String(error);
+            job.errorCode = error?.code;
             job.progress.phase = 'failed';
             job.expiresAt = Date.now() + PARTIAL_EXPORT_JOB_TTL_MS;
             await cleanupPartialExportArtifacts(job);
@@ -14407,14 +14624,32 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
 app.post('/api/backup/export/jobs', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        if (req.body?.scope !== 'partial') {
-            res.status(400).json({ error: 'Only partial export jobs are supported' });
+        const scope = req.body?.scope;
+        if (scope !== 'partial' && scope !== 'full') {
+            res.status(400).json({ error: 'Backup export scope must be partial or full' });
             return;
         }
+        const requestedTarget = req.body?.target;
+        if (requestedTarget !== undefined
+            && requestedTarget !== 'nodeonly'
+            && requestedTarget !== 'upstream'
+            && requestedTarget !== 'main') {
+            res.status(400).json({
+                error: 'Unsupported backup export target',
+                code: 'BACKUP_EXPORT_TARGET_INVALID',
+            });
+            return;
+        }
+        if (scope === 'partial' && requestedTarget !== undefined
+            && requestedTarget !== 'nodeonly') {
+            res.status(400).json({ error: 'Partial export jobs support only nodeonly target' });
+            return;
+        }
+        const target = scope === 'full' ? (requestedTarget ?? 'nodeonly') : 'nodeonly';
         const owner = partialExportOwner(req);
         const requestedId = req.body?.jobId;
         if (typeof requestedId !== 'string' || !PLUGIN_STORAGE_UUID_PATTERN.test(requestedId)) {
-            res.status(400).json({ error: 'Partial export jobId must be a canonical UUID' });
+            res.status(400).json({ error: 'Backup export jobId must be a canonical UUID' });
             return;
         }
         const testCreateDelay = process.env.NODE_ENV === 'test'
@@ -14425,7 +14660,7 @@ app.post('/api/backup/export/jobs', async (req, res, next) => {
         }
         if (wasPartialExportCancelled(owner, requestedId)) {
             res.status(409).json({
-                error: 'Partial export job was cancelled before creation',
+                error: 'Backup export job was cancelled before creation',
                 state: 'cancelled',
             });
             return;
@@ -14433,59 +14668,99 @@ app.post('/api/backup/export/jobs', async (req, res, next) => {
         const existingById = partialExportJobs.get(requestedId);
         if (existingById) {
             if (existingById.owner !== owner) {
-                res.status(409).json({ error: 'Partial export jobId is already in use' });
+                res.status(409).json({ error: 'Backup export jobId is already in use' });
                 return;
             }
-            res.status(202).json({ jobId: existingById.id, state: existingById.state });
+            if (existingById.scope !== scope || existingById.target !== target) {
+                res.status(409).json({ error: 'Backup export jobId has different parameters' });
+                return;
+            }
+            res.status(202).json({
+                jobId: existingById.id,
+                state: existingById.state,
+                scope: existingById.scope,
+                target: existingById.target,
+            });
             return;
         }
-        const existingForOwner = [...partialExportJobs.values()].find(job => job.owner === owner);
+        const existingForOwner = [...partialExportJobs.values()].find(
+            job => job.owner === owner && job.scope === scope,
+        );
         if (existingForOwner) {
             res.status(409).json({
-                error: 'A partial export job is already active for this session',
+                error: `A ${scope} export job is already active for this session`,
                 jobId: existingForOwner.id,
                 state: existingForOwner.state,
             });
             return;
         }
-        if (partialExportJobs.size >= PARTIAL_EXPORT_MAX_ACTIVE_JOBS) {
+        const activeScopeJobs = [...partialExportJobs.values()].filter(
+            job => job.scope === scope,
+        ).length;
+        const scopeCapacity = scope === 'full'
+            ? FULL_EXPORT_MAX_ACTIVE_PINS
+            : PARTIAL_EXPORT_MAX_ACTIVE_JOBS;
+        if (activeScopeJobs >= scopeCapacity) {
             res.status(429).json({
-                error: 'Too many partial export jobs are active',
+                error: `Too many ${scope} export jobs are active`,
                 retryable: true,
             });
             return;
         }
         const id = requestedId;
-        const spoolDir = path.join(partialExportSpoolDir, `${PARTIAL_EXPORT_JOB_PREFIX}${id}`);
-        const pinDir = path.join(spoolDir, 'assets');
+        const spoolDir = scope === 'partial'
+            ? path.join(partialExportSpoolDir, `${PARTIAL_EXPORT_JOB_PREFIX}${id}`)
+            : null;
+        const pinDir = spoolDir ? path.join(spoolDir, 'assets') : null;
+        const filenameSuffix = scope === 'partial'
+            ? '-partial'
+            : (target === 'nodeonly' ? '' : `-${target}`);
         const job = {
             id,
             owner,
+            scope,
+            target,
             state: 'creating',
             createdAt: Date.now(),
-            expiresAt: Date.now() + PARTIAL_EXPORT_JOB_TTL_MS,
+            expiresAt: Date.now() + BACKUP_EXPORT_ACTIVE_TTL_MS,
             abortController: new AbortController(),
             spoolDir,
             pinDir,
-            archiveTempPath: path.join(spoolDir, 'partial-backup.bin.tmp'),
-            archivePath: path.join(spoolDir, 'partial-backup.bin'),
-            filename: `risu-backup-${Date.now()}-partial.bin`,
+            archiveTempPath: spoolDir ? path.join(spoolDir, 'partial-backup.bin.tmp') : null,
+            archivePath: spoolDir ? path.join(spoolDir, 'partial-backup.bin') : null,
+            filename: `risu-backup-${Date.now()}${filenameSuffix}.bin`,
             snapshot: null,
             databaseSpool: null,
+            fullPinnedState: null,
+            entries: [],
+            totalEntries: 0,
+            missingRows: {
+                missingChats: 0,
+                missingChatList: [],
+                missingMcpToolCalls: 0,
+                missingMcpToolCallList: [],
+            },
             missingAssets: 0,
             missingMcpToolCalls: 0,
             missingMcpToolCallList: [],
             size: 0,
             error: null,
+            errorCode: null,
             cleaned: false,
-            progress: { phase: 'queued', current: 0, total: 0, bytes: 0 },
+            progress: {
+                phase: 'queued',
+                current: 0,
+                total: 0,
+                bytes: 0,
+                totalBytes: 0,
+            },
         };
         // Reserve identity, owner admission, and the sole disk budget before
         // the first await. Duplicate creates, concurrent creates, and DELETE
         // now observe this job even while its directory is being created.
         partialExportJobs.set(id, job);
         try {
-            await fs.mkdir(pinDir, { recursive: true, mode: 0o700 });
+            if (pinDir) await fs.mkdir(pinDir, { recursive: true, mode: 0o700 });
         } catch (error) {
             await cleanupPartialExportJob(job);
             throw error;
@@ -14493,13 +14768,20 @@ app.post('/api/backup/export/jobs', async (req, res, next) => {
         if (job.cleaned || job.abortController.signal.aborted) {
             await cleanupPartialExportArtifacts(job);
             if (!res.headersSent) {
-                res.status(409).json({ error: 'Partial export job was cancelled during creation' });
+                res.status(409).json({ error: 'Backup export job was cancelled during creation' });
             }
             return;
         }
         job.state = 'preparing';
-        res.status(202).json({ jobId: id, state: job.state });
-        job.preparation = Promise.resolve().then(() => preparePartialExportJob(job));
+        res.status(202).json({
+            jobId: id,
+            state: job.state,
+            scope: job.scope,
+            target: job.target,
+        });
+        job.preparation = Promise.resolve().then(() => (
+            scope === 'full' ? prepareFullExportJob(job) : preparePartialExportJob(job)
+        ));
     } catch (error) {
         next(error);
     }
@@ -14513,15 +14795,26 @@ app.get('/api/backup/export/jobs/:jobId', async (req, res, next) => {
         res.setHeader('cache-control', 'no-store');
         res.json({
             jobId: job.id,
+            scope: job.scope,
+            target: job.target,
             state: job.state,
             phase: job.progress.phase,
             current: job.progress.current,
             total: job.progress.total,
             bytes: job.progress.bytes,
+            totalBytes: job.progress.totalBytes,
             size: job.state === 'ready' ? job.size : undefined,
             missingAssets: job.missingAssets,
-            missingMcpToolCalls: job.missingMcpToolCalls,
+            missingChats: job.missingRows.missingChats,
+            missingChatList: job.missingRows.missingChatList,
+            missingMcpToolCalls: job.scope === 'full'
+                ? job.missingRows.missingMcpToolCalls
+                : job.missingMcpToolCalls,
+            missingMcpToolCallList: job.scope === 'full'
+                ? job.missingRows.missingMcpToolCallList
+                : job.missingMcpToolCallList,
             error: job.state === 'failed' ? job.error : undefined,
+            code: job.state === 'failed' ? job.errorCode : undefined,
         });
     } catch (error) {
         next(error);
@@ -14533,13 +14826,13 @@ app.delete('/api/backup/export/jobs/:jobId', async (req, res, next) => {
     try {
         const id = req.params.jobId;
         if (!PLUGIN_STORAGE_UUID_PATTERN.test(id)) {
-            res.status(404).json({ error: 'Partial export job not found' });
+            res.status(404).json({ error: 'Backup export job not found' });
             return;
         }
         const owner = partialExportOwner(req);
         const job = partialExportJobs.get(id);
         if (job && job.owner !== owner) {
-            res.status(404).json({ error: 'Partial export job not found' });
+            res.status(404).json({ error: 'Backup export job not found' });
             return;
         }
         recordPartialExportCancellation(owner, id);
@@ -14569,12 +14862,15 @@ app.get('/api/backup/export/jobs/:jobId/download', async (req, res, next) => {
         job = partialExportJobForRequest(req, res);
         if (!job) return;
         if (job.state !== 'ready') {
-            res.status(409).json({ error: 'Partial export is not ready', state: job.state });
+            res.status(409).json({ error: 'Backup export is not ready', state: job.state });
             return;
         }
         consuming = true;
         job.state = 'streaming';
         job.progress.phase = 'streaming';
+        if (job.scope === 'full') {
+            job.expiresAt = Date.now() + BACKUP_EXPORT_ACTIVE_TTL_MS;
+        }
         res.once('close', () => { closed = true; });
         onJobAbort = () => {
             closed = true;
@@ -14585,16 +14881,26 @@ app.get('/api/backup/export/jobs/:jobId/download', async (req, res, next) => {
         res.setHeader('content-type', 'application/octet-stream');
         res.setHeader('content-disposition', `attachment; filename="${job.filename}"`);
         res.setHeader('content-length', job.size);
-        res.setHeader('x-risu-backup-assets', Math.max(0, job.progress.total - 2));
-        res.setHeader('x-risu-backup-missing-assets', job.missingAssets);
-        res.setHeader('x-risu-backup-missing-mcp-tool-calls', job.missingMcpToolCalls);
-        if (job.missingMcpToolCallList.length > 0) {
-            res.setHeader(
-                'x-risu-backup-missing-mcp-tool-call-list',
-                job.missingMcpToolCallList.map(encodeBackupMissingRowDetail).join(','),
-            );
+        if (job.scope === 'full') {
+            res.setHeader('x-risu-backup-assets', job.entries.length);
+            res.setHeader('x-risu-backup-target', job.target);
+            setBackupMissingRowHeaders(res, job.missingRows);
+            if (job.target === 'main') {
+                res.setHeader('x-risu-backup-omitted', 'drafts,remembered-mcp-tool-calls');
+            }
+        } else {
+            res.setHeader('x-risu-backup-assets', Math.max(0, job.progress.total - 2));
+            res.setHeader('x-risu-backup-missing-assets', job.missingAssets);
+            res.setHeader('x-risu-backup-missing-mcp-tool-calls', job.missingMcpToolCalls);
+            if (job.missingMcpToolCallList.length > 0) {
+                res.setHeader(
+                    'x-risu-backup-missing-mcp-tool-call-list',
+                    job.missingMcpToolCallList.map(encodeBackupMissingRowDetail).join(','),
+                );
+            }
         }
-        if (process.env.NODE_ENV === 'test'
+        if (job.scope === 'partial'
+            && process.env.NODE_ENV === 'test'
             && process.env.POCKETRISU_TEST_PARTIAL_EXPORT_STALL_DOWNLOAD === '1') {
             // Deterministically hold a response after headers and a real
             // archive chunk have entered the streaming path. TTL must wake
@@ -14620,7 +14926,25 @@ app.get('/api/backup/export/jobs/:jobId/download', async (req, res, next) => {
             }
             return;
         }
-        if (!await streamFileToWritable(
+        if (job.scope === 'full') {
+            const shouldAbort = () => closed || job.abortController.signal.aborted;
+            for (const entry of job.entries) {
+                throwIfPartialExportCancelled(job);
+                if (!await writePinnedBackupEntry(res, entry, shouldAbort)) return;
+            }
+            if (job.databaseSpool?.size) {
+                const header = encodeBackupEntryHeader(
+                    'database.risudat',
+                    job.databaseSpool.size,
+                );
+                if (!await writeWithBackpressure(res, header, shouldAbort)) return;
+                if (!await streamFileToWritable(
+                    job.databaseSpool.filePath,
+                    res,
+                    shouldAbort,
+                )) return;
+            }
+        } else if (!await streamFileToWritable(
             job.archivePath,
             res,
             () => closed || job.abortController.signal.aborted,

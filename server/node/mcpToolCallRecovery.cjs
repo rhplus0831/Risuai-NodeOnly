@@ -9,7 +9,37 @@ const MCP_TOOL_CALL_SNAPSHOT_MARKER = '__pocketRisuMcpToolCallsFoldedV1';
 const TOOL_CALL_OPEN = '<tool_call>';
 const TOOL_CALL_SEPARATOR = '\uf100';
 const TOOL_CALL_CLOSE = '</tool_call>';
-const MAX_TOOL_CALL_MARKER_CHARS = 64 * 1024;
+const MAX_TOOL_CALL_ID_CHARS = 512;
+const MAX_TOOL_CALL_NAME_CHARS = 256;
+const MAX_TOOL_CALL_MARKER_CHARS = MAX_TOOL_CALL_ID_CHARS
+    + TOOL_CALL_SEPARATOR.length
+    + MAX_TOOL_CALL_NAME_CHARS;
+
+function isPlausibleToolCallField(value, maxChars) {
+    return value.length > 0
+        && value.length <= maxChars
+        && value === value.trim()
+        && !/[\s<>\u0000-\u001f\u007f-\u009f\uf100]/u.test(value);
+}
+
+function parseToolCallMarkerPayload(value, payloadStart, close) {
+    if (close - payloadStart > MAX_TOOL_CALL_MARKER_CHARS) return null;
+    const separator = value.indexOf(TOOL_CALL_SEPARATOR, payloadStart);
+    if (separator < payloadStart || separator >= close) return null;
+    const nextSeparator = value.indexOf(
+        TOOL_CALL_SEPARATOR,
+        separator + TOOL_CALL_SEPARATOR.length,
+    );
+    if (nextSeparator >= 0 && nextSeparator < close) {
+        return null;
+    }
+    const callId = value.slice(payloadStart, separator);
+    const toolName = value.slice(separator + TOOL_CALL_SEPARATOR.length, close);
+    return isPlausibleToolCallField(callId, MAX_TOOL_CALL_ID_CHARS)
+        && isPlausibleToolCallField(toolName, MAX_TOOL_CALL_NAME_CHARS)
+        ? callId
+        : null;
+}
 
 function encodeMcpToolCallId(callId) {
     if (typeof callId !== 'string' || callId.length === 0) return null;
@@ -46,13 +76,8 @@ function collectMcpToolCallIdsFromString(value, output) {
         const payloadStart = open + TOOL_CALL_OPEN.length;
         const close = value.indexOf(TOOL_CALL_CLOSE, payloadStart);
         if (close < 0) return;
-        if (close - payloadStart <= MAX_TOOL_CALL_MARKER_CHARS) {
-            const separator = value.indexOf(TOOL_CALL_SEPARATOR, payloadStart);
-            if (separator >= payloadStart && separator < close) {
-                const callId = value.slice(payloadStart, separator).trim();
-                if (callId) output.add(callId);
-            }
-        }
+        const callId = parseToolCallMarkerPayload(value, payloadStart, close);
+        if (callId) output.add(callId);
         offset = close + TOOL_CALL_CLOSE.length;
     }
 }
@@ -109,13 +134,8 @@ async function scanMcpToolCallIdsFromFile(filePath, { shouldAbort = () => false 
                 offset = payloadStart;
                 continue;
             }
-            if (close - payloadStart <= MAX_TOOL_CALL_MARKER_CHARS) {
-                const separator = text.indexOf(TOOL_CALL_SEPARATOR, payloadStart);
-                if (separator >= payloadStart && separator < close) {
-                    const callId = text.slice(payloadStart, separator).trim();
-                    if (callId) ids.add(callId);
-                }
-            }
+            const callId = parseToolCallMarkerPayload(text, payloadStart, close);
+            if (callId) ids.add(callId);
             offset = close + TOOL_CALL_CLOSE.length;
         }
     }

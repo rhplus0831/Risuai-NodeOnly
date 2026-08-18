@@ -6,7 +6,7 @@
 ## Purpose and recovery taxonomy
 
 This document owns the boundaries that create, export, replace, or recover a coherent
-PocketRisu state. It covers archive framing, point-in-time sources, partial export jobs,
+PocketRisu state. It covers archive framing, point-in-time sources, export jobs,
 bounded imports, save-folder replacement, automatic snapshots, corrupt-boot recovery,
 cancellation, and commit-outcome handling.
 
@@ -14,12 +14,12 @@ These mechanisms are intentionally different:
 
 | Mechanism | Scope and policy |
 |---|---|
-| Downloaded full backup | Node self-contained archive; requires a valid live DB, preserves bare stubs for missing chat rows, and reports skipped referenced payloads in response headers |
+| Downloaded full backup job | Node self-contained archive prepared outside the download request; requires a valid live DB, preserves bare stubs for missing chat rows, and reports skipped referenced payloads in response headers |
 | Main-target downgrade export | Non-destructive migration archive for the PocketRisu `main` rollback target; folds chats and plugin storage while retaining main-readable assets and inlays |
 | Upstream-target export | Migration archive; folds/filters PocketRisu state and intentionally omits inlays |
 | Server-file backup | Same point-in-time cut and missing-row warning policy, published atomically into the configured backup directory |
 | Partial export job | Selected characters/personas/modules and referenced identity assets; recovery-oriented missing-chat policy |
-| Automatic snapshot | DB recovery point stored under `database/dbbackup-*`; preserves a bare missing-chat stub with warning |
+| Automatic snapshot | DB recovery point stored under `database/dbbackup-*`; preserves a bare missing-chat stub and omits an already-missing remembered-tool payload with summarized warnings |
 | Save-folder import | Destructive replacement from a staged directory or ZIP |
 | Per-chat history | Best-effort overwrite pre-images plus required structural-deletion pre-images for one chat row; not part of `.bin` backup archives |
 | Migration safety copy | One-purpose pre-migration material retained for downgrade/emergency recovery |
@@ -50,21 +50,43 @@ Archive entry names are constrained by the shared plugin/key policy and bodies b
 framing format. The live stubs-only database is an internal representation; portability
 is assembled at export boundaries by joining the external rows.
 
-## Full and server-file exports
+## Full jobs and server-file exports
 
-Full download and server-file export share a point-in-time protocol:
+Full download jobs and server-file exports share the same point-in-time cut. A full job:
 
-1. Wait for any destructive import to finish and enter the storage read queue.
-2. Require a present, positive-size, structurally valid live `database/database.bin`.
+1. Reserves a client-chosen canonical UUID and owner synchronously, returns `202`, and
+   prepares independently of the create/status request lifetimes.
+2. Waits for any destructive import to finish, enters the storage read queue, and
+   requires a present, positive-size, structurally valid live `database/database.bin`.
    An internal snapshot is never silently substituted for a missing live DB.
-3. Acquire one read-only SQLite WAL snapshot and select the matching plugin publication.
-4. Copy each required filesystem entry into a private pin, checking open-file/path
+3. Acquires one read-only SQLite WAL snapshot and selects the matching plugin publication.
+4. Copies each required filesystem entry into a private pin, checking open-file/path
    identity, size, device/inode, timestamps, and exact bytes or content hash.
-5. Reserve required disk on each affected volume. Full filesystem pins are capped so
+5. Reserves required disk on each affected volume. Full filesystem pins are capped so
    concurrent exports cannot exhaust space.
-6. Assemble and stream only from the pinned SQLite and filesystem sources.
-7. Release readers, reservations, and private files in `finally`, including disconnect
-   and sink-failure paths.
+6. Assembles the portable database and finalized manifest, then closes the SQLite snapshot
+   and publishes `ready`. The ready job retains immutable private files and its disk
+   reservation, not a second archive-sized copy.
+7. Streams archive framing and file-backed entries from `/:jobId/download`, whose headers
+   are available immediately, then release reservations and private files on success,
+   disconnect, cancellation, or ready-job TTL expiry.
+
+Preparation uses a 24-hour abandoned-work safety deadline instead of the short ready-job
+TTL, so high-cardinality instances may prepare beyond the browser's old 25-minute
+response-header ceiling. Ready and failed jobs then receive the short observation TTL.
+Status exposes phase, item and byte progress. There is one active full job per session
+and at most `FULL_EXPORT_MAX_ACTIVE_PINS` full cuts globally. The legacy direct
+`GET /api/backup/export` route remains as a compatibility surface; the PocketRisu client
+uses the job protocol.
+
+Opening a full download replaces the short ready-job expiry with a 24-hour streaming
+safety deadline, allowing a multi-gigabyte body to outlive preparation metadata bounds.
+Normal success, cancellation, or socket close still cleans the job immediately.
+
+Hash-named, non-legacy assets are copied and hashed once, then verified against their
+filename digest. Legacy/non-content-addressed files retain the second-source-hash
+fallback. Disposable private pins are closed without per-file `fsync`; restart startup
+sweeps unpublished job artifacts.
 
 Missing referenced chat rows do not reject full or server-file exports. The assembler
 preserves each metadata-only stub, logs every missing `chaId/chatId`, and reports bounded
@@ -78,6 +100,8 @@ archives emit only referenced canonical rows; when a referenced payload row is a
 they skip it, log it, and report a bounded count/list warning. The shared selector still
 defaults to `BACKUP_MISSING_MCP_TOOL_CALL_ROW` for callers that do not supply the
 skip-and-warn callback. Upstream-target exports omit this PocketRisu-only namespace.
+Automatic snapshots use the same recovery-oriented missing-payload policy and emit one
+summarized warning per snapshot. A present but malformed payload remains a hard failure.
 
 Node-only downloads, server-file archives, and partial archives also select
 composer rows under `drafts/` from the pinned SQLite view. Export selection is
@@ -122,17 +146,18 @@ Rollback** and warns about the two omitted namespaces. Restore the result into a
 PocketRisu backup until verification completes. Directly booting `main` against the
 row-backed `serve` directory remains unsupported.
 
-## Partial export jobs
+## Export job protocol
 
-Partial export is a server job, not a browser-memory serializer:
+Full and partial exports share one server job route family rather than browser-memory
+serialization:
 
-1. The client creates a job with a client-chosen ID and selected entities.
-2. The server pins one SQLite view and verified copies of selected identity assets.
-3. It joins selected chat rows, folds the exact plugin publication when required, omits
-   account-wide state, and records missing assets rather than inventing bytes.
+1. The client creates a job with a client-chosen ID, `scope`, and full-export `target`.
+2. The server pins one SQLite view and verified private filesystem copies.
+3. Full jobs retain all target-selected entries; partial jobs retain referenced identity
+   assets, omit account-wide state, and record missing assets rather than inventing bytes.
 4. The client polls progress and downloads the private completed archive.
 5. DELETE cancels preparation or releases the finished job. Cancellation tombstones make
-   repeated cleanup safe; jobs also expire by TTL.
+   repeated cleanup safe; ready and failed jobs expire by TTL.
 
 There is one active partial job per session. A missing referenced chat row is preserved
 as a bare stub with a warning. A missing referenced remembered MCP payload is skipped,
@@ -140,9 +165,10 @@ recorded on the job, and exposed through the download warning headers. Sink cons
 or write failure must cancel both the response body and browser sink so the server can
 release the pin.
 
-The current endpoints are the create/status/cancel collection under
-`/api/backup/export/jobs` plus `/:jobId/download`. Calling the old partial scope through
-the full-export endpoint returns `PARTIAL_EXPORT_JOB_REQUIRED`.
+The endpoints are the create/status/cancel collection under `/api/backup/export/jobs`
+plus `/:jobId/download`. Full requests use `{scope: "full", target:
+"nodeonly"|"main"|"upstream", jobId}`. Calling the old partial scope through the direct
+full-export endpoint returns `PARTIAL_EXPORT_JOB_REQUIRED`.
 
 ## Bounded import and save-folder replacement
 
@@ -354,11 +380,12 @@ setting does not create a Docker persistence boundary.
 
 ## Change map
 
-- Full/server point-in-time export: start at `pinFullBackupState()`,
+- Full/server point-in-time export: start at `prepareFullExportJob()`,
+  `pinFullBackupState()`,
   `buildSelfContainedBackupDatabase()`, `selectReferencedMcpToolCallEntries()`,
   `streamBackupRisuSave.cjs`, filesystem pin/copy helpers, disk reservations,
   `NodeStorage.saveServerBackup()`, `backuplocal.ts`, and full export regression suites.
-- Partial jobs: update preparation/writer code, the `/api/backup/export/jobs` route
+- Full/partial jobs: update preparation/writer code, the `/api/backup/export/jobs` route
   family, `NodeStorage.exportBackup()`, and `backuplocal.ts` together.
 - Archive framing: coordinate `backupEntryFormat.cjs`, shared key policy, import parser,
   and framing/round-trip tests.
@@ -378,6 +405,7 @@ setting does not create a Docker persistence boundary.
 Representative guarantees live in:
 
 - `test/compat/full-export-database-source.test.ts`
+- `test/compat/full-export-jobs.test.ts`
 - `test/compat/full-export-boundaries.test.ts`
 - `test/compat/backup-snapshot-integrity.test.ts`
 - `test/compat/mcp-tool-call-recovery.test.ts`

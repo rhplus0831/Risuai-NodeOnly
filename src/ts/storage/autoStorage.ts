@@ -203,13 +203,14 @@ export class AutoStorage{
     async exportBackup(
         opts?: {
             target?: 'upstream' | 'main'
-            scope?: 'partial'
+            scope?: 'partial' | 'full'
             signal?: AbortSignal | null
             onPreparationProgress?: (progress: {
                 phase: string
                 current: number
                 total: number
                 bytes: number
+                totalBytes: number
             }) => void
         },
         signal?: AbortSignal | null,

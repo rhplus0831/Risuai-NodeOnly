@@ -40,11 +40,23 @@ describe('MCP tool-call recovery helpers', () => {
 
   test('collects complete markers recursively and ignores malformed text', () => {
     const ids = collectMcpToolCallIds({
-      message: [{ data: '<tool_call>call-a\uf100lookup</tool_call>' }],
-      swipes: ['before <tool_call>call-b\uf100search</tool_call> after'],
+      message: [{ data: '<tool_call>google_search:0\uf100lookup</tool_call>' }],
+      swipes: [
+        'before <tool_call>550e8400-e29b-41d4-a716-446655440000\uf100search</tool_call> after',
+        '<tool_call>call_provider_1\uf100tool.name</tool_call>',
+        '<tool_call>toolu_bdrk_01ABC\uf100mcp-tool</tool_call>',
+      ],
       malformed: '<tool_call>missing-close\uf100lookup',
+      whitespace: '<tool_call>call with spaces\uf100lookup</tool_call>',
+      markup: '<tool_call>call-id\uf100<script></tool_call>',
+      embeddedSource: 'const marker = `<tool_call>${callId}`;\nconst tail = "\uf100lookup</tool_call>";',
     })
-    expect([...ids].sort()).toEqual(['call-a', 'call-b'])
+    expect([...ids].sort()).toEqual([
+      '550e8400-e29b-41d4-a716-446655440000',
+      'call_provider_1',
+      'google_search:0',
+      'toolu_bdrk_01ABC',
+    ])
   })
 
   test('streaming scan retains markers split across file pages', async () => {
@@ -59,5 +71,20 @@ describe('MCP tool-call recovery helpers', () => {
     ]))
 
     expect([...await scanMcpToolCallIdsFromFile(filePath)]).toEqual(['call-cross-page'])
+  })
+
+  test('streaming scan rejects source fragments with literal marker syntax', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'mcp-recovery-source-test-'))
+    tempDirectories.push(directory)
+    const filePath = path.join(directory, 'database.risudat')
+    await writeFile(filePath, [
+      'const open = "<tool_call>";',
+      'const template = `${providerCall.id}`;',
+      'const close = "\uf100lookup</tool_call>";',
+      '<tool_call>call-valid:1\uf100lookup</tool_call>',
+    ].join('\n'))
+
+    expect([...await scanMcpToolCallIdsFromFile(filePath)])
+      .toEqual(['call-valid:1'])
   })
 })

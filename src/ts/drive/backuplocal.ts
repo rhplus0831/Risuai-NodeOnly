@@ -166,49 +166,64 @@ function startBackupCleanup(cleanup: () => Promise<unknown> | undefined) {
     }
 }
 
-export async function SaveLocalBackup(){
+async function saveFullLocalBackup(
+    target: 'upstream' | 'main' | undefined,
+    preparingMessage: string,
+    filenameSuffix: string,
+    showDetailedError = false,
+) {
+    const controller = new AbortController()
+    const cancelAction = () => controller.abort(
+        new DOMException('Backup cancelled', 'AbortError'),
+    )
     try {
-        alertWait("Saving local backup...")
-        const response = await forageStorage.exportBackup()
+        alertWait(preparingMessage, cancelAction)
+        const response = await forageStorage.exportBackup({
+            ...(target ? { target } : {}),
+            signal: controller.signal,
+            onPreparationProgress: ({ phase, current, total, bytes, totalBytes }) => {
+                const count = total > 0 ? ` ${current}/${total}` : ''
+                const copied = bytes > 0
+                    ? `, ${formatBytes(bytes)}${totalBytes > 0 ? `/${formatBytes(totalBytes)}` : ''}`
+                    : ''
+                alertWait(`Preparing local backup (${phase}${count}${copied})...`, cancelAction)
+            },
+        })
         const missingRows = readBackupMissingRows(response)
-        await streamBackupToDisk(response, `risu-backup-${Date.now()}.bin`)
+        await streamBackupToDisk(
+            response,
+            `risu-backup-${Date.now()}${filenameSuffix}.bin`,
+            controller.signal,
+        )
         if (!showBackupWarning('Backup successful.', missingRowWarningItems(missingRows))) {
             notifySuccess('Success')
         }
     } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            alertClear()
+            notifyInfo('Backup cancelled')
+            return
+        }
         console.error(error)
-        alertError('Failed')
+        alertError(showDetailedError && error instanceof Error ? error.message : 'Failed')
     }
+}
+
+export async function SaveLocalBackup(){
+    return saveFullLocalBackup(undefined, 'Saving local backup...', '')
 }
 
 export async function SaveLocalBackupForUpstream(){
-    try {
-        alertWait("Saving local backup...")
-        const response = await forageStorage.exportBackup({ target: 'upstream' })
-        const missingRows = readBackupMissingRows(response)
-        await streamBackupToDisk(response, `risu-backup-${Date.now()}-upstream.bin`)
-        if (!showBackupWarning('Backup successful.', missingRowWarningItems(missingRows))) {
-            notifySuccess('Success')
-        }
-    } catch (error) {
-        console.error(error)
-        alertError('Failed')
-    }
+    return saveFullLocalBackup('upstream', 'Saving local backup...', '-upstream')
 }
 
 export async function SaveLocalBackupForMain(){
-    try {
-        alertWait("Preparing a main-compatible rollback export...")
-        const response = await forageStorage.exportBackup({ target: 'main' })
-        const missingRows = readBackupMissingRows(response)
-        await streamBackupToDisk(response, `risu-backup-${Date.now()}-main.bin`)
-        if (!showBackupWarning('Backup successful.', missingRowWarningItems(missingRows))) {
-            notifySuccess('Success')
-        }
-    } catch (error) {
-        console.error(error)
-        alertError(error instanceof Error ? error.message : 'Failed')
-    }
+    return saveFullLocalBackup(
+        'main',
+        'Preparing a main-compatible rollback export...',
+        '-main',
+        true,
+    )
 }
 
 /**
